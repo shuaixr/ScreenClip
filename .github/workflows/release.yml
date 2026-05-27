@@ -1,0 +1,134 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without the leading v, for example 1.2.3
+        required: true
+        type: string
+      tag_name:
+        description: Optional tag name. Defaults to v<version>.
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare release tag
+        id: meta
+        shell: pwsh
+        run: |
+          $tagName = "${{ inputs.tag_name }}"
+          if ([string]::IsNullOrWhiteSpace($tagName)) {
+            $tagName = "v${{ inputs.version }}"
+          }
+
+          "tag_name=$tagName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+          $localTag = git rev-parse --verify "refs/tags/$tagName" 2>$null
+          $remoteTag = git ls-remote --tags origin "refs/tags/$tagName"
+
+          if (-not $localTag -and -not [string]::IsNullOrWhiteSpace($remoteTag)) {
+            git fetch origin "refs/tags/$tagName:refs/tags/$tagName"
+            $localTag = git rev-parse --verify "refs/tags/$tagName" 2>$null
+          }
+
+          if (-not $localTag) {
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag -a $tagName -m "Release $tagName"
+            "tag_created=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } else {
+            "tag_created=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\.cargo\registry
+            ~\.cargo\git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build production binary
+        shell: pwsh
+        run: cargo build --release --verbose
+
+      - name: Install cargo-wix
+        shell: pwsh
+        run: cargo install cargo-wix --locked
+
+      - name: Install WiX Toolset
+        shell: pwsh
+        run: choco install wixtoolset -y --no-progress
+
+      - name: Locate WiX binaries
+        shell: pwsh
+        run: |
+          $candle = Get-ChildItem 'C:\Program Files','C:\Program Files (x86)' -Recurse -Filter candle.exe -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
+          if (-not $candle) {
+            throw 'candle.exe not found after installing WiX Toolset'
+          }
+
+          "WIX_BIN_PATH=$($candle.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build MSI installer
+        shell: pwsh
+        run: cargo wix --no-build --profile release --nocapture --bin-path "$env:WIX_BIN_PATH"
+
+      - name: Resolve installer asset
+        id: package
+        shell: pwsh
+        run: |
+          $tagName = "${{ steps.meta.outputs.tag_name }}"
+          $msi = Get-ChildItem -Path "target/wix" -Filter "*.msi" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+
+          if (-not $msi) {
+            throw "MSI not found under target/wix"
+          }
+
+          $assetName = "screenclip-$tagName-windows-x64.msi"
+          Copy-Item -Path $msi.FullName -Destination $assetName -Force
+
+          "asset_name=$assetName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Push release tag
+        if: steps.meta.outputs.tag_created == 'true'
+        shell: pwsh
+        run: |
+          $tagName = "${{ steps.meta.outputs.tag_name }}"
+          git push origin $tagName
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tagName = "${{ steps.meta.outputs.tag_name }}"
+          $assetName = "${{ steps.package.outputs.asset_name }}"
+
+          gh release view $tagName 1>$null 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tagName $assetName --clobber
+          } else {
+            gh release create $tagName $assetName --title $tagName --generate-notes
+          }
