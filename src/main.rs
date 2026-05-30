@@ -75,6 +75,26 @@ struct SelectionResizeDrag {
     edge: ResizeEdge,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscapeAction {
+    ExitTextMode,
+    CloseSession,
+}
+
+impl EscapeAction {
+    fn for_overlay_state(has_active_session: bool, text_insert_mode: bool) -> Option<Self> {
+        if !has_active_session {
+            return None;
+        }
+
+        if text_insert_mode {
+            return Some(Self::ExitTextMode);
+        }
+
+        Some(Self::CloseSession)
+    }
+}
+
 struct App {
     initialized: bool,
     event_proxy: EventLoopProxy<AppEvent>,
@@ -244,6 +264,33 @@ impl App {
         self.text_annotation_drag = None;
     }
 
+    fn escape_action(&self) -> Option<EscapeAction> {
+        EscapeAction::for_overlay_state(!self.windows.is_empty(), self.text_insert_mode)
+    }
+
+    fn exit_text_insert_mode(&mut self) {
+        self.text_insert_mode = false;
+        self.pending_text_focus_id = None;
+        self.focused_text_annotation_id = None;
+        self.text_annotation_drag = None;
+        self.next_caret_redraw = None;
+        self.needs_redraw = true;
+    }
+
+    fn handle_escape(&mut self) -> bool {
+        match self.escape_action() {
+            Some(EscapeAction::ExitTextMode) => {
+                self.exit_text_insert_mode();
+                true
+            }
+            Some(EscapeAction::CloseSession) => {
+                self.end_capture_session();
+                true
+            }
+            None => false,
+        }
+    }
+
     fn create_egui_context(&self) -> egui::Context {
         let egui_ctx = egui::Context::default();
         let mut fonts = egui::FontDefinitions::default();
@@ -330,6 +377,17 @@ impl ApplicationHandler<AppEvent> for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        if let WindowEvent::KeyboardInput { event, .. } = &event {
+            if event.state == ElementState::Pressed
+                && matches!(event.logical_key, Key::Named(NamedKey::Escape))
+            {
+                let handled = self.handle_escape();
+                if handled {
+                    return;
+                }
+            }
+        }
+
         let is_redraw_event = matches!(event, WindowEvent::RedrawRequested);
         if let Some(ws) = self.windows.get_mut(&window_id) {
             let _ = ws.egui.state.on_window_event(&ws.window, &event);
@@ -340,13 +398,6 @@ impl ApplicationHandler<AppEvent> for App {
 
         match event {
             WindowEvent::CloseRequested => self.end_capture_session(),
-            WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed
-                    && matches!(event.logical_key, Key::Named(NamedKey::Escape))
-                {
-                    self.end_capture_session();
-                }
-            }
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(state) = self.windows.get(&window_id) {
                     let gx = state.origin.x + position.x.round() as i32;
@@ -777,6 +828,83 @@ fn capture_or_fallback(screens: &[Screen], x: i32, y: i32, width: u32, height: u
     }
 
     RgbaImage::from_pixel(width.max(1), height.max(1), Rgba([70, 70, 70, 255]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::OnceLock;
+
+    #[cfg(target_os = "windows")]
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+
+    #[test]
+    fn escape_action_prefers_exiting_text_mode() {
+        assert_eq!(
+            EscapeAction::for_overlay_state(true, true),
+            Some(EscapeAction::ExitTextMode)
+        );
+    }
+
+    #[test]
+    fn escape_action_closes_session_when_not_editing_text() {
+        assert_eq!(
+            EscapeAction::for_overlay_state(true, false),
+            Some(EscapeAction::CloseSession)
+        );
+    }
+
+    #[test]
+    fn escape_action_is_ignored_without_active_session() {
+        assert_eq!(EscapeAction::for_overlay_state(false, false), None);
+        assert_eq!(EscapeAction::for_overlay_state(false, true), None);
+    }
+
+    #[test]
+    fn exit_text_insert_mode_clears_text_edit_state_only() {
+        let mut app = App::new(test_event_proxy());
+        app.text_insert_mode = true;
+        app.selected_rect = Some((1, 2, 3, 4));
+        app.pending_text_focus_id = Some(7);
+        app.focused_text_annotation_id = Some(7);
+        app.text_annotation_drag = Some(TextAnnotationDrag {
+            id: 7,
+            pointer_offset: (3, 4),
+        });
+        app.next_caret_redraw = Some(Instant::now());
+        app.needs_redraw = false;
+
+        app.exit_text_insert_mode();
+
+        assert!(!app.text_insert_mode);
+        assert_eq!(app.pending_text_focus_id, None);
+        assert_eq!(app.focused_text_annotation_id, None);
+        assert!(app.text_annotation_drag.is_none());
+        assert!(app.next_caret_redraw.is_none());
+        assert!(app.needs_redraw);
+        assert_eq!(app.selected_rect, Some((1, 2, 3, 4)));
+    }
+
+    fn test_event_proxy() -> EventLoopProxy<AppEvent> {
+        static TEST_EVENT_PROXY: OnceLock<EventLoopProxy<AppEvent>> = OnceLock::new();
+
+        TEST_EVENT_PROXY
+            .get_or_init(|| {
+                #[cfg(target_os = "windows")]
+                let event_loop = EventLoop::<AppEvent>::with_user_event()
+                    .with_any_thread(true)
+                    .build()
+                    .expect("failed to create test event loop");
+
+                #[cfg(not(target_os = "windows"))]
+                let event_loop = EventLoop::<AppEvent>::with_user_event()
+                    .build()
+                    .expect("failed to create test event loop");
+
+                event_loop.create_proxy()
+            })
+            .clone()
+    }
 }
 
 fn render_window_cpu(
