@@ -38,6 +38,12 @@ use winit::{
 use std::borrow::Cow;
 
 #[cfg(target_os = "windows")]
+use windows_sys::Win32::{
+    Foundation::{GetLastError, ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE},
+    System::Console::{AttachConsole, ATTACH_PARENT_PROCESS},
+};
+
+#[cfg(target_os = "windows")]
 use winit::platform::windows::WindowAttributesExtWindows;
 
 struct WindowEgui {
@@ -268,6 +274,47 @@ impl App {
     }
 }
 
+fn init_console_ctrl_c_shutdown(event_proxy: EventLoopProxy<AppEvent>) {
+    #[cfg(target_os = "windows")]
+    if !attach_parent_console_if_available() {
+        info!("startup: no parent console detected, Ctrl+C shutdown integration is inactive");
+        return;
+    }
+
+    match ctrlc::set_handler(move || {
+        let _ = event_proxy.send_event(AppEvent::QuitRequested);
+    }) {
+        Ok(()) => info!("startup: Ctrl+C handler registered"),
+        Err(err) => warn!("startup: failed to register Ctrl+C handler: {}", err),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn attach_parent_console_if_available() -> bool {
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) != 0 {
+            info!("startup: attached to parent console");
+            return true;
+        }
+
+        let error_code = GetLastError();
+        if error_code == ERROR_ACCESS_DENIED {
+            // Already attached to a console.
+            return true;
+        }
+
+        if error_code == ERROR_INVALID_HANDLE {
+            return false;
+        } else {
+            warn!(
+                "startup: failed to attach parent console (error {}), Ctrl+C may be unavailable",
+                error_code
+            );
+            return false;
+        }
+    }
+}
+
 fn main() {
     env_logger::Builder::from_default_env()
         .filter_module("screenclip", log::LevelFilter::Info)
@@ -278,7 +325,10 @@ fn main() {
         .expect("failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let mut app = App::new(event_loop.create_proxy());
+    let event_proxy = event_loop.create_proxy();
+    init_console_ctrl_c_shutdown(event_proxy.clone());
+
+    let mut app = App::new(event_proxy);
     event_loop.run_app(&mut app).expect("event loop failed");
 }
 

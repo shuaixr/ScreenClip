@@ -27,6 +27,7 @@ egui-winit = { version = "0.31.1", default-features = false, features = [
 ] }
 egui-phosphor = "0.9"
 env_logger = "0.11"
+ctrlc = "3.4"
 global-hotkey = "0.8"
 log = "0.4"
 raw-window-handle = "0.6"
@@ -42,6 +43,7 @@ winit = { version = "0.30.7", default-features = false, features = [
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
+    "Win32_System_Console",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
