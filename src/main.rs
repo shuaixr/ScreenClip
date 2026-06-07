@@ -1056,6 +1056,7 @@ fn render_window_cpu(
     if state.needs_show {
         state.needs_show = false;
         state.window.set_visible(true);
+        state.window.focus_window();
     }
 
     (action, focused_annotation_id)
