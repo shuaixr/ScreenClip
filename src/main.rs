@@ -1,29 +1,30 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod annotations;
 mod cpu_present;
 mod cpu_renderer;
 mod desktop_geometry;
 mod hotkeys;
 mod overlay_ui;
 mod selection_geometry;
-mod text_annotations;
 mod tray;
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
 use ab_glyph::FontArc;
+use annotations::rectangle::RectangleAnnotation;
+use annotations::text::{
+    TextAnnotation, TextAnnotationCursorHit, TextAnnotationDrag, TEXT_CARET_BLINK_INTERVAL,
+    TEXT_LINE_HEIGHT_PIXELS,
+};
 use arboard::{Clipboard, ImageData};
 use cpu_present::CpuPresenter;
 use cpu_renderer::CpuRenderer;
 use log::{info, warn};
-use overlay_ui::{OverlayAction, OverlayUi};
+use overlay_ui::{OverlayAction, OverlayUi, ToolMode};
 use screenshots::image::{imageops::FilterType, Rgba, RgbaImage};
 use screenshots::Screen;
 use selection_geometry::ResizeEdge;
-use text_annotations::{
-    TextAnnotation, TextAnnotationCursorHit, TextAnnotationDrag, TEXT_CARET_BLINK_INTERVAL,
-    TEXT_LINE_HEIGHT_PIXELS,
-};
 use winit::{
     application::ApplicationHandler,
     dpi::{PhysicalPosition, PhysicalSize, Position, Size},
@@ -83,20 +84,21 @@ struct SelectionResizeDrag {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EscapeAction {
     ExitTextMode,
+    ExitRectangleMode,
     CloseSession,
 }
 
 impl EscapeAction {
-    fn for_overlay_state(has_active_session: bool, text_insert_mode: bool) -> Option<Self> {
+    fn for_overlay_state(has_active_session: bool, tool_mode: ToolMode) -> Option<Self> {
         if !has_active_session {
             return None;
         }
 
-        if text_insert_mode {
-            return Some(Self::ExitTextMode);
+        match tool_mode {
+            ToolMode::Text => Some(Self::ExitTextMode),
+            ToolMode::Rectangle => Some(Self::ExitRectangleMode),
+            ToolMode::Select => Some(Self::CloseSession),
         }
-
-        Some(Self::CloseSession)
     }
 }
 
@@ -112,8 +114,9 @@ struct App {
     selected_rect: Option<(i32, i32, i32, i32)>,
     selection_resize: Option<SelectionResizeDrag>,
     captures: Vec<CapturedMonitor>,
-    text_insert_mode: bool,
+    tool_mode: ToolMode,
     text_annotations: Vec<TextAnnotation>,
+    rectangle_annotations: Vec<RectangleAnnotation>,
     next_text_annotation_id: u64,
     pending_text_focus_id: Option<u64>,
     text_font_bytes: Vec<(String, Vec<u8>)>,
@@ -138,8 +141,9 @@ impl App {
             selected_rect: None,
             selection_resize: None,
             captures: Vec::new(),
-            text_insert_mode: false,
+            tool_mode: ToolMode::default(),
             text_annotations: Vec::new(),
+            rectangle_annotations: Vec::new(),
             next_text_annotation_id: 0,
             pending_text_focus_id: None,
             text_font_bytes: Vec::new(),
@@ -259,8 +263,9 @@ impl App {
         self.drag_current = None;
         self.selected_rect = None;
         self.selection_resize = None;
-        self.text_insert_mode = false;
+        self.tool_mode = ToolMode::Select;
         self.text_annotations.clear();
+        self.rectangle_annotations.clear();
         self.next_text_annotation_id = 0;
         self.pending_text_focus_id = None;
         self.needs_redraw = false;
@@ -270,11 +275,11 @@ impl App {
     }
 
     fn escape_action(&self) -> Option<EscapeAction> {
-        EscapeAction::for_overlay_state(!self.windows.is_empty(), self.text_insert_mode)
+        EscapeAction::for_overlay_state(!self.windows.is_empty(), self.tool_mode)
     }
 
-    fn exit_text_insert_mode(&mut self) {
-        self.text_insert_mode = false;
+    fn exit_text_mode(&mut self) {
+        self.tool_mode = ToolMode::Select;
         self.pending_text_focus_id = None;
         self.focused_text_annotation_id = None;
         self.text_annotation_drag = None;
@@ -282,10 +287,19 @@ impl App {
         self.needs_redraw = true;
     }
 
+    fn exit_rectangle_mode(&mut self) {
+        self.tool_mode = ToolMode::Select;
+        self.needs_redraw = true;
+    }
+
     fn handle_escape(&mut self) -> bool {
         match self.escape_action() {
             Some(EscapeAction::ExitTextMode) => {
-                self.exit_text_insert_mode();
+                self.exit_text_mode();
+                true
+            }
+            Some(EscapeAction::ExitRectangleMode) => {
+                self.exit_rectangle_mode();
                 true
             }
             Some(EscapeAction::CloseSession) => {
@@ -478,10 +492,10 @@ impl ApplicationHandler<AppEvent> for App {
                 ..
             } => match state {
                 ElementState::Pressed => {
-                    if self.text_insert_mode {
+                    if matches!(self.tool_mode, ToolMode::Text) {
                         if let Some(pointer) = self.last_cursor_global {
                             if let Some(id) = self.focused_text_annotation_id {
-                                if text_annotations::border_hit_test(
+                                if annotations::text::border_hit_test(
                                     &self.text_annotations,
                                     &self.text_fonts,
                                     id,
@@ -514,36 +528,45 @@ impl ApplicationHandler<AppEvent> for App {
                         })
                         .unwrap_or(false);
                     if !egui_blocks {
-                        if !self.text_insert_mode {
-                            if let (Some(pointer), Some(rect)) =
-                                (self.last_cursor_global, self.selected_rect)
-                            {
-                                if let Some(edge) =
-                                    selection_geometry::detect_resize_edge(rect, pointer)
+                        match self.tool_mode {
+                            ToolMode::Select => {
+                                if let (Some(pointer), Some(rect)) =
+                                    (self.last_cursor_global, self.selected_rect)
                                 {
-                                    self.selection_resize = Some(SelectionResizeDrag { edge });
-                                    return;
+                                    if let Some(edge) =
+                                        selection_geometry::detect_resize_edge(rect, pointer)
+                                    {
+                                        self.selection_resize = Some(SelectionResizeDrag { edge });
+                                        return;
+                                    }
+                                }
+                                if let Some(p) = self.last_cursor_global {
+                                    self.selection_resize = None;
+                                    self.drag_start = Some(p);
+                                    self.drag_current = Some(p);
+                                    self.selected_rect = None;
                                 }
                             }
-                        }
-
-                        if self.text_insert_mode {
-                            if let Some(p) = self.last_cursor_global {
-                                let id = self.next_text_annotation_id;
-                                self.next_text_annotation_id += 1;
-                                self.text_annotations.push(TextAnnotation::new(
-                                    id,
-                                    p,
-                                    TEXT_LINE_HEIGHT_PIXELS,
-                                ));
-                                self.focused_text_annotation_id = Some(id);
-                                self.pending_text_focus_id = Some(id);
+                            ToolMode::Text => {
+                                if let Some(p) = self.last_cursor_global {
+                                    let id = self.next_text_annotation_id;
+                                    self.next_text_annotation_id += 1;
+                                    self.text_annotations.push(TextAnnotation::new(
+                                        id,
+                                        p,
+                                        TEXT_LINE_HEIGHT_PIXELS,
+                                    ));
+                                    self.focused_text_annotation_id = Some(id);
+                                    self.pending_text_focus_id = Some(id);
+                                }
                             }
-                        } else if let Some(p) = self.last_cursor_global {
-                            self.selection_resize = None;
-                            self.drag_start = Some(p);
-                            self.drag_current = Some(p);
-                            self.selected_rect = None;
+                            ToolMode::Rectangle => {
+                                if let Some(p) = self.last_cursor_global {
+                                    self.selection_resize = None;
+                                    self.drag_start = Some(p);
+                                    self.drag_current = Some(p);
+                                }
+                            }
                         }
                     }
                 }
@@ -556,14 +579,30 @@ impl ApplicationHandler<AppEvent> for App {
                         return;
                     }
 
-                    if self.text_insert_mode {
-                        return;
+                    match self.tool_mode {
+                        ToolMode::Text => {}
+                        ToolMode::Rectangle => {
+                            if let Some(rect) =
+                                current_selection_rect(self.drag_start, self.drag_current)
+                            {
+                                if rect.2 > 0 && rect.3 > 0 {
+                                    self.rectangle_annotations
+                                        .push(RectangleAnnotation { global_rect: rect });
+                                }
+                            }
+                            self.drag_start = None;
+                            self.drag_current = None;
+                        }
+                        ToolMode::Select => {
+                            if let Some(rect) =
+                                current_selection_rect(self.drag_start, self.drag_current)
+                            {
+                                self.selected_rect = Some(rect);
+                            }
+                            self.drag_start = None;
+                            self.drag_current = None;
+                        }
                     }
-                    if let Some(rect) = current_selection_rect(self.drag_start, self.drag_current) {
-                        self.selected_rect = Some(rect);
-                    }
-                    self.drag_start = None;
-                    self.drag_current = None;
                 }
             },
             WindowEvent::Resized(new_size) => {
@@ -626,8 +665,15 @@ impl ApplicationHandler<AppEvent> for App {
 
         self.needs_redraw = false;
 
-        let active_rect =
-            current_selection_rect(self.drag_start, self.drag_current).or(self.selected_rect);
+        let drag_rect = current_selection_rect(self.drag_start, self.drag_current);
+        let active_selection_rect = match self.tool_mode {
+            ToolMode::Select => drag_rect.or(self.selected_rect),
+            ToolMode::Text | ToolMode::Rectangle => self.selected_rect,
+        };
+        let active_annotation_rect = match self.tool_mode {
+            ToolMode::Rectangle => drag_rect,
+            _ => None,
+        };
         let show_toolbar = self.drag_start.is_none()
             && self.selection_resize.is_none()
             && self.selected_rect.is_some();
@@ -642,12 +688,14 @@ impl ApplicationHandler<AppEvent> for App {
         for state in self.windows.values_mut() {
             let (action, focused_annotation_id) = render_window_cpu(
                 state,
-                active_rect,
+                active_selection_rect,
+                active_annotation_rect,
                 self.selected_rect,
                 self.last_cursor_global,
                 show_toolbar,
-                self.text_insert_mode,
+                self.tool_mode,
                 &mut self.text_annotations,
+                &self.rectangle_annotations,
                 &mut self.pending_text_focus_id,
                 &self.text_fonts,
                 existing_focused_text_annotation_id,
@@ -664,7 +712,17 @@ impl ApplicationHandler<AppEvent> for App {
                 info!("[about_to_wait] OverlayAction::Copy received");
                 pending_copy = true;
             } else if action == OverlayAction::StartTextInsert {
-                self.text_insert_mode = true;
+                self.tool_mode = if self.tool_mode == ToolMode::Text {
+                    ToolMode::Select
+                } else {
+                    ToolMode::Text
+                };
+            } else if action == OverlayAction::StartRectangleInsert {
+                self.tool_mode = if self.tool_mode == ToolMode::Rectangle {
+                    ToolMode::Select
+                } else {
+                    ToolMode::Rectangle
+                };
             } else if action == OverlayAction::Exit {
                 info!("[about_to_wait] OverlayAction::Exit received");
                 pending_exit = true;
@@ -701,6 +759,7 @@ impl ApplicationHandler<AppEvent> for App {
                         rect,
                         &path,
                         &self.text_annotations,
+                        &self.rectangle_annotations,
                         &self.text_fonts,
                     ) {
                         Ok(()) => info!("saved screenshot to {}", path.display()),
@@ -722,6 +781,7 @@ impl ApplicationHandler<AppEvent> for App {
                     &self.captures,
                     rect,
                     &self.text_annotations,
+                    &self.rectangle_annotations,
                     &self.text_fonts,
                 ) {
                     Ok(image) => match copy_image_to_clipboard(image) {
@@ -735,7 +795,7 @@ impl ApplicationHandler<AppEvent> for App {
             return;
         }
 
-        if self.text_insert_mode {
+        if matches!(self.tool_mode, ToolMode::Text) {
             let deadline = Instant::now() + TEXT_CARET_BLINK_INTERVAL;
             self.next_caret_redraw = Some(deadline);
             event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
@@ -758,9 +818,16 @@ fn save_selection_to_file(
     rect: (i32, i32, i32, i32),
     path: &PathBuf,
     text_annotations: &[TextAnnotation],
+    rectangle_annotations: &[RectangleAnnotation],
     text_fonts: &[FontArc],
 ) -> Result<(), String> {
-    let output = compose_selection_image(captures, rect, text_annotations, text_fonts)?;
+    let output = compose_selection_image(
+        captures,
+        rect,
+        text_annotations,
+        rectangle_annotations,
+        text_fonts,
+    )?;
 
     output
         .save(path)
@@ -773,6 +840,7 @@ fn compose_selection_image(
     captures: &[CapturedMonitor],
     rect: (i32, i32, i32, i32),
     text_annotations: &[TextAnnotation],
+    rectangle_annotations: &[RectangleAnnotation],
     text_fonts: &[FontArc],
 ) -> Result<RgbaImage, String> {
     let (x, y, w, h) = rect;
@@ -813,7 +881,8 @@ fn compose_selection_image(
         }
     }
 
-    text_annotations::render_to_image(&mut output, rect, text_annotations, text_fonts)?;
+    annotations::text::render_to_image(&mut output, rect, text_annotations, text_fonts)?;
+    annotations::rectangle::render_to_image(&mut output, rect, rectangle_annotations);
 
     Ok(output)
 }
@@ -890,29 +959,44 @@ mod tests {
     #[test]
     fn escape_action_prefers_exiting_text_mode() {
         assert_eq!(
-            EscapeAction::for_overlay_state(true, true),
+            EscapeAction::for_overlay_state(true, ToolMode::Text),
             Some(EscapeAction::ExitTextMode)
         );
     }
 
     #[test]
-    fn escape_action_closes_session_when_not_editing_text() {
+    fn escape_action_exits_rectangle_mode() {
         assert_eq!(
-            EscapeAction::for_overlay_state(true, false),
+            EscapeAction::for_overlay_state(true, ToolMode::Rectangle),
+            Some(EscapeAction::ExitRectangleMode)
+        );
+    }
+
+    #[test]
+    fn escape_action_closes_session_in_select_mode() {
+        assert_eq!(
+            EscapeAction::for_overlay_state(true, ToolMode::Select),
             Some(EscapeAction::CloseSession)
         );
     }
 
     #[test]
     fn escape_action_is_ignored_without_active_session() {
-        assert_eq!(EscapeAction::for_overlay_state(false, false), None);
-        assert_eq!(EscapeAction::for_overlay_state(false, true), None);
+        assert_eq!(
+            EscapeAction::for_overlay_state(false, ToolMode::Select),
+            None
+        );
+        assert_eq!(EscapeAction::for_overlay_state(false, ToolMode::Text), None);
+        assert_eq!(
+            EscapeAction::for_overlay_state(false, ToolMode::Rectangle),
+            None
+        );
     }
 
     #[test]
-    fn exit_text_insert_mode_clears_text_edit_state_only() {
+    fn exit_text_mode_clears_text_edit_state_only() {
         let mut app = App::new(test_event_proxy());
-        app.text_insert_mode = true;
+        app.tool_mode = ToolMode::Text;
         app.selected_rect = Some((1, 2, 3, 4));
         app.pending_text_focus_id = Some(7);
         app.focused_text_annotation_id = Some(7);
@@ -923,9 +1007,9 @@ mod tests {
         app.next_caret_redraw = Some(Instant::now());
         app.needs_redraw = false;
 
-        app.exit_text_insert_mode();
+        app.exit_text_mode();
 
-        assert!(!app.text_insert_mode);
+        assert_eq!(app.tool_mode, ToolMode::Select);
         assert_eq!(app.pending_text_focus_id, None);
         assert_eq!(app.focused_text_annotation_id, None);
         assert!(app.text_annotation_drag.is_none());
@@ -958,12 +1042,14 @@ mod tests {
 
 fn render_window_cpu(
     state: &mut WindowState,
-    active_rect: Option<(i32, i32, i32, i32)>,
+    active_selection_rect: Option<(i32, i32, i32, i32)>,
+    active_annotation_rect: Option<(i32, i32, i32, i32)>,
     selected_rect: Option<(i32, i32, i32, i32)>,
     cursor_global: Option<(i32, i32)>,
     show_toolbar: bool,
-    text_insert_mode: bool,
+    tool_mode: ToolMode,
     text_annotations: &mut [TextAnnotation],
+    rectangle_annotations: &[RectangleAnnotation],
     pending_text_focus_id: &mut Option<u64>,
     text_fonts: &[FontArc],
     focused_text_annotation_id: Option<u64>,
@@ -975,14 +1061,14 @@ fn render_window_cpu(
     state.egui.ctx.begin_pass(raw_input);
     let action = state.egui.ui.draw(
         &state.egui.ctx,
-        active_rect,
+        active_selection_rect,
         cursor_global,
         show_toolbar,
         state.origin,
         (state.size.width, state.size.height),
         pixels_per_point,
     );
-    let focused_annotation_id = text_annotations::draw_input_hosts(
+    let focused_annotation_id = annotations::text::draw_input_hosts(
         &state.egui.ctx,
         state.origin,
         (state.size.width, state.size.height),
@@ -1003,7 +1089,7 @@ fn render_window_cpu(
         .handle_platform_output(&state.window, full_output.platform_output);
     if let Some(cursor_icon) = resolve_cursor_icon(
         egui_cursor_icon,
-        text_insert_mode,
+        tool_mode,
         cursor_global,
         selected_rect,
         text_annotations,
@@ -1026,20 +1112,27 @@ fn render_window_cpu(
     state.renderer.render(
         &state.screenshot,
         (state.origin.x, state.origin.y),
-        active_rect,
+        active_selection_rect,
         pixels_per_point,
         &paint_jobs,
         |renderer| {
             let visual_focused_annotation_id = focused_annotation_id
                 .or(dragging_text_annotation_id)
                 .or(focused_text_annotation_id);
-            text_annotations::draw_preview(
+            annotations::text::draw_preview(
                 renderer.frame_mut(),
                 (state.size.width, state.size.height),
                 state.origin,
                 text_annotations,
                 text_fonts,
                 visual_focused_annotation_id,
+            );
+            annotations::rectangle::draw_preview(
+                renderer.frame_mut(),
+                (state.size.width, state.size.height),
+                state.origin,
+                rectangle_annotations,
+                active_annotation_rect,
             );
         },
     );
@@ -1063,7 +1156,7 @@ fn render_window_cpu(
 
 fn resolve_cursor_icon(
     egui_cursor_icon: egui::CursorIcon,
-    text_insert_mode: bool,
+    tool_mode: ToolMode,
     cursor_global: Option<(i32, i32)>,
     selected_rect: Option<(i32, i32, i32, i32)>,
     text_annotations: &[TextAnnotation],
@@ -1080,9 +1173,12 @@ fn resolve_cursor_icon(
         return Some(cursor_icon_for_resize_edge(edge));
     }
 
+    let in_text_mode = matches!(tool_mode, ToolMode::Text);
+    let in_select_mode = matches!(tool_mode, ToolMode::Select);
+
     if let Some(point) = cursor_global {
-        if text_insert_mode {
-            if let Some(TextAnnotationCursorHit::Border) = text_annotations::cursor_hit_test(
+        if in_text_mode {
+            if let Some(TextAnnotationCursorHit::Border) = annotations::text::cursor_hit_test(
                 text_annotations,
                 text_fonts,
                 focused_text_annotation_id,
@@ -1092,7 +1188,7 @@ fn resolve_cursor_icon(
             }
         }
 
-        if !text_insert_mode {
+        if in_select_mode {
             if let Some(rect) = selected_rect {
                 if let Some(edge) = selection_geometry::detect_resize_edge(rect, point) {
                     return Some(cursor_icon_for_resize_edge(edge));
@@ -1105,9 +1201,9 @@ fn resolve_cursor_icon(
         return translate_egui_cursor_icon(egui_cursor_icon);
     }
 
-    if text_insert_mode {
+    if in_text_mode {
         if let Some(point) = cursor_global {
-            match text_annotations::cursor_hit_test(
+            match annotations::text::cursor_hit_test(
                 text_annotations,
                 text_fonts,
                 focused_text_annotation_id,
