@@ -5,7 +5,6 @@ mod cpu_renderer;
 mod desktop_geometry;
 mod hotkeys;
 mod overlay_ui;
-mod overlay_ui_utils;
 mod selection_geometry;
 mod text_annotations;
 mod tray;
