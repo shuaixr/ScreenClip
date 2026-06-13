@@ -96,7 +96,18 @@ pub enum OverlayAction {
     Save,
     Copy,
     StartTextInsert,
+    StartRectangleInsert,
     Exit,
+}
+
+/// Active tool. `Select` is the default: drag to make a screenshot region.
+/// `Text` / `Rectangle` are annotation tools toggled on from the toolbar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolMode {
+    #[default]
+    Select,
+    Text,
+    Rectangle,
 }
 
 /// Modular overlay UI — add more widgets by calling more draw_* helpers in `draw`.
@@ -222,7 +233,7 @@ impl OverlayUi {
         const BTN: f32 = 32.0;
         const GAP: f32 = 4.0;
         const PAD: f32 = 4.0;
-        const N: f32 = 4.0;
+        const N: f32 = 5.0;
 
         let toolbar_w = PAD * 2.0 + N * BTN + (N - 1.0) * GAP;
         let toolbar_h = PAD * 2.0 + BTN;
@@ -264,6 +275,9 @@ impl OverlayUi {
                             }
                             if icon_button(ui, egui_phosphor::regular::TEXT_T, BTN) {
                                 action = OverlayAction::StartTextInsert;
+                            }
+                            if icon_button(ui, egui_phosphor::regular::SQUARE, BTN) {
+                                action = OverlayAction::StartRectangleInsert;
                             }
                             if icon_button(ui, egui_phosphor::regular::X, BTN) {
                                 action = OverlayAction::Exit;
