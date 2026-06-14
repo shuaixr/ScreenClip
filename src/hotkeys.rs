@@ -73,10 +73,36 @@ fn screenshot_hotkey_label() -> &'static str {
 pub(crate) fn log_install_error(err: &global_hotkey::Error) {
     warn!("failed to register screenshot hotkey: {err}");
 
+    log_registration_hints();
+}
+
+pub(crate) fn log_registration_succeeded() {
+    // The crate's `register()` returning Ok is not a guarantee that the OS
+    // will actually deliver the key event — on Wayland, registration is
+    // silently rejected by the compositor for most keys. Surface a hint
+    // when we detect a Wayland session even though registration nominally
+    // succeeded, so the user is not left wondering why PrintScreen does
+    // nothing.
+    log_registration_hints();
+}
+
+fn log_registration_hints() {
     #[cfg(target_os = "linux")]
-    warn!(
-        "global PrintScreen registration can be blocked by Wayland or the desktop environment; configure a compositor shortcut if needed"
-    );
+    {
+        let on_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+        let on_x11 = std::env::var_os("DISPLAY").is_some();
+        if on_wayland {
+            warn!(
+                "running under Wayland; global hotkeys are typically blocked by the compositor. \
+                 Bind a desktop shortcut to `screenclip --capture` (Settings → Keyboard → \
+                 Custom Shortcuts) instead of relying on PrintScreen."
+            );
+        } else if !on_x11 {
+            warn!(
+                "no X11 display server detected; global hotkey registration is unlikely to work"
+            );
+        }
+    }
 
     #[cfg(target_os = "macos")]
     warn!(

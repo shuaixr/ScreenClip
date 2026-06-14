@@ -20,7 +20,7 @@ use annotations::text::{
 use arboard::{Clipboard, ImageData};
 use cpu_present::CpuPresenter;
 use cpu_renderer::CpuRenderer;
-use log::{info, warn};
+use log::{debug, info, warn};
 use overlay_ui::{OverlayAction, OverlayUi, ToolMode};
 use screenshots::image::{imageops::FilterType, Rgba, RgbaImage};
 use screenshots::Screen;
@@ -129,6 +129,11 @@ struct App {
     next_caret_redraw: Option<Instant>,
     focused_text_annotation_id: Option<u64>,
     text_annotation_drag: Option<TextAnnotationDrag>,
+    /// True if `--capture` was passed on the command line: the next `resumed()`
+    /// invocation will synthesize a `CaptureRequested` event and then clear
+    /// this flag, so a single CLI invocation always triggers exactly one
+    /// capture session regardless of how many times the OS resumes the app.
+    capture_on_start: bool,
     /// The previous `SPI_GETANIMATION` value captured right before we disabled
     /// window animations for a capture session, so we can restore it afterwards.
     /// `None` means no restore is pending.
@@ -137,7 +142,7 @@ struct App {
 }
 
 impl App {
-    fn new(event_proxy: EventLoopProxy<AppEvent>) -> Self {
+    fn new(event_proxy: EventLoopProxy<AppEvent>, capture_on_start: bool) -> Self {
         Self {
             initialized: false,
             event_proxy,
@@ -161,6 +166,7 @@ impl App {
             next_caret_redraw: None,
             focused_text_annotation_id: None,
             text_annotation_drag: None,
+            capture_on_start,
             #[cfg(target_os = "windows")]
             saved_animation_info: None,
         }
@@ -390,15 +396,19 @@ impl App {
 fn init_console_ctrl_c_shutdown(event_proxy: EventLoopProxy<AppEvent>) {
     #[cfg(target_os = "windows")]
     if !attach_parent_console_if_available() {
-        info!("startup: no parent console detected, Ctrl+C shutdown integration is inactive");
+        debug!("startup: no parent console detected, terminal Ctrl+C is inactive");
         return;
     }
 
     match ctrlc::set_handler(move || {
         let _ = event_proxy.send_event(AppEvent::QuitRequested);
     }) {
-        Ok(()) => info!("startup: Ctrl+C handler registered"),
-        Err(err) => warn!("startup: failed to register Ctrl+C handler: {}", err),
+        // Only relevant when the app is launched from a terminal — the handler
+        // forwards the terminal's SIGINT to a clean shutdown. Demoted to debug
+        // because the message is easily mistaken for the app hijacking Ctrl+C
+        // system-wide, which it does not.
+        Ok(()) => debug!("startup: terminal SIGINT handler registered"),
+        Err(err) => warn!("startup: failed to register terminal SIGINT handler: {err}"),
     }
 }
 
@@ -479,10 +489,56 @@ fn set_window_animation_enabled(enabled: bool) -> bool {
     }
 }
 
+fn parse_cli_args() -> CliArgs {
+    let mut capture_on_start = false;
+    let mut show_help = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--capture" | "-c" => capture_on_start = true,
+            "--help" | "-h" => show_help = true,
+            "--version" | "-V" => {
+                println!("screenclip {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            other if other.starts_with('-') => {
+                eprintln!("unknown flag: {other}\n");
+                show_help = true;
+            }
+            other => {
+                eprintln!("unexpected positional argument: {other}\n");
+                show_help = true;
+            }
+        }
+    }
+    if show_help {
+        println!(
+            "screenclip {}\n\n\
+             USAGE:\n  \
+               screenclip [OPTIONS]\n\n\
+             OPTIONS:\n  \
+               -c, --capture    Skip the global hotkey check and start a capture session\n  \
+                               immediately. Useful when the desktop environment (e.g.\n  \
+                               GNOME/Wayland) blocks global hotkeys — bind a shortcut to\n  \
+                               `screenclip --capture` instead.\n  \
+               -h, --help       Show this message and exit\n  \
+               -V, --version    Show the version and exit",
+            env!("CARGO_PKG_VERSION"),
+        );
+        std::process::exit(0);
+    }
+    CliArgs { capture_on_start }
+}
+
+struct CliArgs {
+    capture_on_start: bool,
+}
+
 fn main() {
     env_logger::Builder::from_default_env()
         .filter_module("screenclip", log::LevelFilter::Info)
         .init();
+
+    let CliArgs { capture_on_start } = parse_cli_args();
 
     let event_loop = EventLoop::<AppEvent>::with_user_event()
         .build()
@@ -492,7 +548,7 @@ fn main() {
     let event_proxy = event_loop.create_proxy();
     init_console_ctrl_c_shutdown(event_proxy.clone());
 
-    let mut app = App::new(event_proxy);
+    let mut app = App::new(event_proxy, capture_on_start);
     event_loop.run_app(&mut app).expect("event loop failed");
 }
 
@@ -512,7 +568,10 @@ impl ApplicationHandler<AppEvent> for App {
             .collect();
 
         match hotkeys::HotkeyRuntime::new(self.event_proxy.clone()) {
-            Ok(runtime) => self.hotkeys = Some(runtime),
+            Ok(runtime) => {
+                self.hotkeys = Some(runtime);
+                hotkeys::log_registration_succeeded();
+            }
             Err(err) => hotkeys::log_install_error(&err),
         }
 
@@ -528,6 +587,14 @@ impl ApplicationHandler<AppEvent> for App {
         }
 
         self.initialized = true;
+
+        if self.capture_on_start {
+            // Synthesize the same event the global hotkey would emit, then
+            // clear the flag so subsequent resumes (e.g. suspend/resume
+            // cycles on Wayland) do not re-trigger a capture.
+            self.capture_on_start = false;
+            let _ = self.event_proxy.send_event(AppEvent::CaptureRequested);
+        }
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
@@ -1105,7 +1172,7 @@ mod tests {
 
     #[test]
     fn exit_text_mode_clears_text_edit_state_only() {
-        let mut app = App::new(test_event_proxy());
+        let mut app = App::new(test_event_proxy(), false);
         app.tool_mode = ToolMode::Text;
         app.selected_rect = Some((1, 2, 3, 4));
         app.pending_text_focus_id = Some(7);
