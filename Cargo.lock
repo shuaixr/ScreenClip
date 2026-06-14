@@ -3113,6 +3113,7 @@ dependencies = [
  "egui-winit",
  "env_logger",
  "global-hotkey",
+ "gtk",
  "log",
  "raw-window-handle",
  "rfd",

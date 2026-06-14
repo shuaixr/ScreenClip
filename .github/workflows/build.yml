@@ -10,9 +10,17 @@ on:
       - master
       - dev
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    runs-on: windows-latest
+    name: ${{ matrix.os }} build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
 
     steps:
       - name: Checkout
@@ -25,15 +33,35 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ~\.cargo\registry
-            ~\.cargo\git
+            ~/.cargo/registry
+            ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build
-        run: cargo build --verbose
+      - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config \
+            libgtk-3-dev libglib2.0-dev \
+            libayatana-appindicator3-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libdbus-1-dev \
+            libxdo-dev
 
-      - name: Test
-        run: cargo test --verbose
+      - name: Build & test (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          cargo build --verbose
+          cargo test --verbose
+
+      - name: Check (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo check --verbose --all-targets

@@ -516,6 +516,12 @@ impl ApplicationHandler<AppEvent> for App {
             Err(err) => hotkeys::log_install_error(&err),
         }
 
+        // `tray-icon` does not auto-initialize GTK on Linux; it panics inside
+        // `Menu::new` if gtk is not initialized first. We must call gtk::init
+        // before constructing the tray icon, but it is a no-op on other OSes.
+        #[cfg(target_os = "linux")]
+        gtk::init().expect("failed to initialize GTK for tray icon");
+
         match tray::TrayRuntime::new(self.event_proxy.clone()) {
             Ok(runtime) => self.tray = Some(runtime),
             Err(err) => tray::log_install_error(err.as_ref()),

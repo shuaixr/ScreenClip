@@ -5,8 +5,60 @@ edition = "2021"
 authors = ["ScreenClip"]
 description = "Screenshot capture utility"
 
-[package.metadata.wix]
-eula = false
+[package.metadata.packager]
+product-name = "ScreenClip"
+identifier = "com.screenclip.app"
+authors = ["ScreenClip"]
+category = "Utility"
+description = "Screenshot capture utility"
+
+icons = [
+    "assets/icons/Product.ico",
+    "assets/icons/256x256.png",
+]
+
+# Auto-emit a .desktop file and hicolor icon symlinks on Linux.
+[package.metadata.packager.linux]
+generate-desktop-entry = true
+
+# NSIS is the Windows installer format. installer-mode = "currentUser"
+# mirrors the old WiX InstallScope="perUser" — no admin required.
+[package.metadata.packager.nsis]
+installer-mode = "currentUser"
+
+# Deb metadata. Section "utils" + the runtime libs not bundled into the
+# AppImage. winit/tray-icon/softbuffer pull in GTK3 + appindicator + X11/Wayland.
+[package.metadata.packager.deb]
+section = "utils"
+priority = "optional"
+depends = [
+    "libc6",
+    "libgtk-3-0",
+    "libayatana-appindicator3-1",
+    "libxcb1",
+    "libxcb-render0-0",
+    "libxcb-shape0-0",
+    "libxcb-xfixes0-0",
+    "libxkbcommon0",
+    "libwayland-client0",
+    "libwayland-cursor0",
+    "libwayland-egl1",
+    "libdbus-1-3",
+    "libxdo3",
+]
+
+# AppImage uses linuxdeploy + the gtk plugin. Explicitly list the Wayland
+# + xkb libs the binary dlopens at runtime.
+[package.metadata.packager.appimage]
+libs = [
+    "libwayland-client.so.0",
+    "libwayland-cursor.so.0",
+    "libwayland-egl.so.1",
+    "libxkbcommon.so.0",
+    "libxcb-shape.so.0",
+    "libxcb-xfixes.so.0",
+]
+linuxdeploy-plugins = { gtk = "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh" }
 
 [build-dependencies]
 winres = "0.1"
@@ -47,6 +99,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+# tray-icon 0.24 does not auto-initialize GTK on Linux. We must do it
+# ourselves in main.rs before constructing the tray icon, so we depend
+# on gtk directly (Linux-only).
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
 
 [profile.release]
 opt-level = 3

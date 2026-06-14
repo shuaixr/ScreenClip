@@ -24,3 +24,9 @@ rustc-ice-*.txt
 #.idea/
 
 tools/
+
+# WiX / MSIX / code-signing legacy artifacts (superseded by cargo-packager).
+wix/
+*.msix
+*.pfx
+*.pfx.b64
