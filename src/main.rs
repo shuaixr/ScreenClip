@@ -32,7 +32,7 @@ use winit::{
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{Key, NamedKey},
     monitor::MonitorHandle,
-    window::{Cursor, CursorIcon, Fullscreen, Window, WindowAttributes, WindowId, WindowLevel},
+    window::{Cursor, CursorIcon, Window, WindowAttributes, WindowId, WindowLevel},
 };
 
 use std::borrow::Cow;
@@ -41,6 +41,10 @@ use std::borrow::Cow;
 use windows_sys::Win32::{
     Foundation::{GetLastError, ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE},
     System::Console::{AttachConsole, ATTACH_PARENT_PROCESS},
+    UI::WindowsAndMessaging::{
+        SystemParametersInfoW, ANIMATIONINFO, SPI_GETANIMATION, SPI_SETANIMATION,
+        SPIF_SENDCHANGE,
+    },
 };
 
 #[cfg(target_os = "windows")]
@@ -125,6 +129,11 @@ struct App {
     next_caret_redraw: Option<Instant>,
     focused_text_annotation_id: Option<u64>,
     text_annotation_drag: Option<TextAnnotationDrag>,
+    /// The previous `SPI_GETANIMATION` value captured right before we disabled
+    /// window animations for a capture session, so we can restore it afterwards.
+    /// `None` means no restore is pending.
+    #[cfg(target_os = "windows")]
+    saved_animation_info: Option<ANIMATIONINFO>,
 }
 
 impl App {
@@ -152,6 +161,8 @@ impl App {
             next_caret_redraw: None,
             focused_text_annotation_id: None,
             text_annotation_drag: None,
+            #[cfg(target_os = "windows")]
+            saved_animation_info: None,
         }
     }
 
@@ -163,6 +174,15 @@ impl App {
 
         self.reset_capture_state();
 
+        // Suppress the Windows "Show Animation" that plays when a window becomes
+        // visible — otherwise our overlay scales/fades in instead of appearing
+        // instantly, which looks like a flash on every launch.
+        #[cfg(target_os = "windows")]
+        {
+            self.saved_animation_info = read_window_animation_setting();
+            set_window_animation_enabled(false);
+        }
+
         let monitors: Vec<MonitorHandle> = event_loop.available_monitors().collect();
         let screens = Screen::all().unwrap_or_default();
         info!("detected {} monitors", monitors.len());
@@ -172,6 +192,15 @@ impl App {
             let pos = monitor.position();
             let monitor_for_window = monitor.clone();
 
+            // Cover the monitor with a borderless, always-on-top window instead of
+            // `Fullscreen::Borderless` — winit's fullscreen path runs
+            // `force_window_active()` (SendInput of an Alt keypress) which makes
+            // Windows render a system label with the window title at the top of
+            // the focused monitor for one frame. See:
+            //   - winit #4116 (borderless flicker on creation)
+            //   - winit #3576 (DWMWA_CLOAK, the proper upstream fix)
+            //   - winit platform_impl/windows/window.rs `force_window_active`
+            let _ = monitor_for_window;
             let mut attrs = WindowAttributes::default()
                 .with_title(format!("overlay-{}", idx))
                 .with_decorations(false)
@@ -191,8 +220,6 @@ impl App {
                     .create_window(attrs)
                     .expect("create window failed"),
             );
-            window.set_fullscreen(Some(Fullscreen::Borderless(Some(monitor_for_window))));
-            window.set_outer_position(PhysicalPosition::new(pos.x, pos.y));
             window.set_cursor(Cursor::Icon(CursorIcon::Crosshair));
 
             let image = capture_or_fallback(&screens, pos.x, pos.y, size.width, size.height);
@@ -253,6 +280,32 @@ impl App {
             state.window.set_visible(false);
         }
         self.reset_capture_state();
+
+        // Restore the user's animation setting that we stashed at the start of
+        // the capture session.
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(info) = self.saved_animation_info.take() {
+                let restore = ANIMATIONINFO {
+                    cbSize: info.cbSize,
+                    iMinAnimate: info.iMinAnimate,
+                };
+                unsafe {
+                    let ok = SystemParametersInfoW(
+                        SPI_SETANIMATION,
+                        restore.cbSize,
+                        &restore as *const _ as *mut _,
+                        SPIF_SENDCHANGE,
+                    );
+                    if ok == 0 {
+                        warn!(
+                            "failed to restore SPI_SETANIMATION (error {})",
+                            GetLastError()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn reset_capture_state(&mut self) {
@@ -371,6 +424,57 @@ fn attach_parent_console_if_available() -> bool {
                 error_code
             );
             return false;
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn read_window_animation_setting() -> Option<ANIMATIONINFO> {
+    unsafe {
+        let mut info = ANIMATIONINFO {
+            cbSize: std::mem::size_of::<ANIMATIONINFO>() as u32,
+            iMinAnimate: 1,
+        };
+        let ok = SystemParametersInfoW(
+            SPI_GETANIMATION,
+            info.cbSize,
+            &mut info as *mut _ as *mut _,
+            0,
+        );
+        if ok == 0 {
+            warn!(
+                "SPI_GETANIMATION failed (error {})",
+                GetLastError()
+            );
+            None
+        } else {
+            Some(info)
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn set_window_animation_enabled(enabled: bool) -> bool {
+    unsafe {
+        let mut info = ANIMATIONINFO {
+            cbSize: std::mem::size_of::<ANIMATIONINFO>() as u32,
+            iMinAnimate: if enabled { 1 } else { 0 },
+        };
+        let ok = SystemParametersInfoW(
+            SPI_SETANIMATION,
+            info.cbSize,
+            &mut info as *mut _ as *mut _,
+            SPIF_SENDCHANGE,
+        );
+        if ok == 0 {
+            warn!(
+                "SPI_SETANIMATION({}) failed (error {})",
+                if enabled { "enable" } else { "disable" },
+                GetLastError()
+            );
+            false
+        } else {
+            true
         }
     }
 }
