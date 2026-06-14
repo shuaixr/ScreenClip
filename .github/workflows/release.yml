@@ -71,43 +71,27 @@ jobs:
         shell: pwsh
         run: cargo build --release --verbose
 
-      - name: Install cargo-wix
+      - name: Install cargo-packager
         shell: pwsh
-        run: cargo install cargo-wix --locked
+        run: cargo install cargo-packager --locked
 
-      - name: Install WiX Toolset
+      - name: Build NSIS installer
         shell: pwsh
-        run: choco install wixtoolset -y --no-progress
-
-      - name: Locate WiX binaries
-        shell: pwsh
-        run: |
-          $candle = Get-ChildItem 'C:\Program Files','C:\Program Files (x86)' -Recurse -Filter candle.exe -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-
-          if (-not $candle) {
-            throw 'candle.exe not found after installing WiX Toolset'
-          }
-
-          "WIX_BIN_PATH=$($candle.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-      - name: Build MSI installer
-        shell: pwsh
-        run: cargo wix --no-build --profile release --nocapture --bin-path "$env:WIX_BIN_PATH"
+        run: cargo packager --release --verbose
 
       - name: Resolve installer asset
         id: package
         shell: pwsh
         run: |
           $tagName = "${{ steps.meta.outputs.tag_name }}"
-          $msi = Get-ChildItem -Path "target/wix" -Filter "*.msi" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          $installer = Get-ChildItem -Path "target/release" -Filter "*-setup.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 
-          if (-not $msi) {
-            throw "MSI not found under target/wix"
+          if (-not $installer) {
+            throw "Installer executable not found under target/release"
           }
 
-          $assetName = "screenclip-$tagName-windows-x64.msi"
-          Copy-Item -Path $msi.FullName -Destination $assetName -Force
+          $assetName = "screenclip-$tagName-windows-x64.exe"
+          Copy-Item -Path $installer.FullName -Destination $assetName -Force
 
           "asset_name=$assetName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 

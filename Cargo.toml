@@ -4,9 +4,32 @@ version = "0.0.1-dev.2"
 edition = "2021"
 authors = ["ScreenClip"]
 description = "Screenshot capture utility"
+homepage = "https://github.com/shuaixr/screenclip"
+repository = "https://github.com/shuaixr/screenclip"
+license = "MIT OR Apache-2.0"
+categories = ["multimedia::graphics"]
 
-[package.metadata.wix]
-eula = false
+[package.metadata.packager]
+product-name = "ScreenClip"
+identifier = "dev.screenclip.app"
+publisher = "ScreenClip"
+description = "Screenshot capture utility"
+long-description = """
+ScreenClip is a Rust based screenshot utility built with egui and winit,
+focused on fast screen capture and annotation workflows, with global hotkey
+support and a desktop overlay UI.
+"""
+homepage = "https://github.com/shuaixr/screenclip"
+authors = ["ScreenClip"]
+category = "Utility"
+icons = ["assets/icons/Product.ico"]
+binaries = [{ path = "screenclip", main = true }]
+formats = ["nsis"]
+
+[package.metadata.packager.nsis]
+installer-mode = "currentUser"
+installer-icon = "assets/icons/Product.ico"
+compression = "lzma"
 
 [build-dependencies]
 winres = "0.1"
