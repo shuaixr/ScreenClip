@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSIX manifest for ScreenClip. Consumed by the makeappx pack step in CI.
+
+  IMPORTANT:
+    - Identity/@Publisher MUST match the signing certificate's Subject string
+      byte-for-byte (e.g. "CN=ScreenClip Dev, O=ScreenClip Dev, C=US"). MSIX
+      installation fails with a signature mismatch otherwise.
+    - Version is Major.Minor.Patch[.Revision] (four-part). Take it from
+      Cargo's package.version with a "0" appended if necessary.
+    - The Logo paths assume MSIX staging layout (see release.yml):
+          <stage>/AppxManifest.xml
+          <stage>/screenclip.exe
+          <stage>/assets/icons/*.png
+
+  Replaces the cargo-wix MSI behaviors:
+    - HKCU\...\Run auto-launch  ->  <uap5:Extension Category="windows.startupTask">
+    - PATH environment mutation ->  <uap3:Extension Category="windows.appExecutionAlias">
+-->
+<Package
+    xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+    xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+    xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
+    xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
+    xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+    IgnorableNamespaces="uap uap3 uap5 rescap">
+
+    <Identity
+        Name="ScreenClip"
+        Publisher="CN=ScreenClip Dev, O=ScreenClip Dev, C=US"
+        Version="0.0.1.2" />
+
+    <Properties>
+        <DisplayName>ScreenClip</DisplayName>
+        <PublisherDisplayName>ScreenClip Dev</PublisherDisplayName>
+        <Logo>assets\icons\Square50x50Logo.png</Logo>
+    </Properties>
+
+    <Dependencies>
+        <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.22621.0" />
+    </Dependencies>
+
+    <Resources>
+        <Resource Language="en-us" />
+        <Resource uap:Scale="100" />
+        <Resource uap:Scale="125" />
+        <Resource uap:Scale="150" />
+        <Resource uap:Scale="200" />
+    </Resources>
+
+    <Applications>
+        <Application Id="ScreenClip" Executable="screenclip.exe" EntryPoint="Windows.FullTrustApplication">
+            <uap:VisualElements
+                BackgroundColor="transparent"
+                DisplayName="ScreenClip"
+                Description="Screenshot capture utility"
+                Square150x150Logo="assets\icons\Square150x150Logo.png"
+                Square44x44Logo="assets\icons\Square44x44Logo.png">
+                <uap:DefaultTile
+                    Wide310x310Logo="assets\icons\Square310x310Logo.png"
+                    Square71x71Logo="assets\icons\Square71x71Logo.png"
+                    Square310x310Logo="assets\icons\Square310x310Logo.png" />
+            </uap:VisualElements>
+
+            <Extensions>
+                <!-- Auto-launch at user logon. Replaces the cargo-wix MSI's HKCU\...\Run entry. -->
+                <uap5:Extension Category="windows.startupTask">
+                    <uap5:StartupTask
+                        TaskId="ScreenClipAutoStart"
+                        Enabled="true"
+                        DisplayName="ScreenClip" />
+                </uap5:Extension>
+
+                <!-- App Execution Alias: lets `screenclip` be invoked from any shell. -->
+                <uap3:Extension Category="windows.appExecutionAlias">
+                    <uap3:AppExecutionAlias>
+                        <desktop:Extension
+                            xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+                            Category="windows.appExecutionAlias">
+                            <desktop:AppExecutionAlias>
+                                <desktop:Exe Name="screenclip.exe" />
+                            </desktop:AppExecutionAlias>
+                        </desktop:Extension>
+                    </uap3:AppExecutionAlias>
+                </uap3:Extension>
+            </Extensions>
+        </Application>
+    </Applications>
+
+    <Capabilities>
+        <rescap:Capability Name="runFullTrust" />
+    </Capabilities>
+</Package>

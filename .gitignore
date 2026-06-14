@@ -24,3 +24,7 @@ rustc-ice-*.txt
 #.idea/
 
 tools/
+
+# Code signing certificates (regenerated locally and uploaded by hand)
+*.pfx
+*.pfx.b64

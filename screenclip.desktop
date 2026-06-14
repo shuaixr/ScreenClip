@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=ScreenClip
+GenericName=Screenshot Utility
+Comment=Capture and annotate screenshots
+Exec=screenclip %F
+Icon=screenclip
+Terminal=false
+Categories=Graphics;Photography;Utility;
+StartupNotify=true
+StartupWMClass=ScreenClip
+Keywords=screenshot;capture;snip;annotation;
+MimeType=image/png;

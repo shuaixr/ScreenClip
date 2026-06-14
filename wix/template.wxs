@@ -1,0 +1,130 @@
+<?xml version='1.0' encoding='windows-1252'?>
+<!--
+  WiX template consumed by `cargo-packager` (see Cargo.toml [package.metadata.packager.wix]).
+  Variables injected by cargo-packager:
+    $(var.ProductName)        = ScreenClip
+    $(var.ProductManufacturer)= shuaixr
+    $(var.Version)            = Cargo package version (Major.Minor.Patch)
+
+  This template is a stripped-down version of the original `cargo-wix` main.wxs:
+    - Auto-launch (HKCU\...\Run) and PATH environment features were removed; both
+      behaviors are now owned by the NSIS installer (see [package.metadata.packager.nsis]).
+    - UpgradeCode E95B02B0-A89C-4445-BCEB-0BDC70B7EFC4 is preserved so existing
+      cargo-wix MSI installs upgrade in-place rather than appearing as a new product.
+    - InstallScope='perUser' keeps installation non-elevated, matching the legacy behavior.
+-->
+
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+
+    <Product
+        Id='*'
+        Name='$(var.ProductName)'
+        UpgradeCode='E95B02B0-A89C-4445-BCEB-0BDC70B7EFC4'
+        Manufacturer='$(var.ProductManufacturer)'
+        Language='1033'
+        Codepage='1252'
+        Version='$(var.Version)'>
+
+        <Package Id='*'
+            Keywords='Installer'
+            Description='Screenshot capture utility'
+            Manufacturer='$(var.ProductManufacturer)'
+            InstallerVersion='450'
+            Languages='1033'
+            Compressed='yes'
+            InstallScope='perUser'
+            SummaryCodepage='1252'
+            />
+
+        <MajorUpgrade
+            Schedule='afterInstallInitialize'
+            DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
+
+        <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
+        <Property Id='DiskPrompt' Value='$(var.ProductName) Installation'/>
+
+        <Directory Id='TARGETDIR' Name='SourceDir'>
+            <Directory Id='LocalAppDataFolder'>
+                <Directory Id='APPLICATIONFOLDER' Name='$(var.ProductName)'>
+                    <Component Id='AppFolderCleanup' Guid='*'>
+                        <RegistryValue
+                            Root='HKCU'
+                            Key='Software\$(var.ProductManufacturer)\$(var.ProductName)'
+                            Name='Installed'
+                            Type='integer'
+                            Value='1'
+                            KeyPath='yes'/>
+                        <RemoveFolder Id='RemoveApplicationFolder' On='uninstall'/>
+                    </Component>
+
+                    <Directory Id='Bin' Name='bin'>
+                        <Component Id='binary0' Guid='7D3B9F59-0FE4-4B31-9B55-9E4B7D4C2C1A'>
+                            <File
+                                Id='exe0'
+                                Name='$(var.ProductName).exe'
+                                DiskId='1'
+                                Source='$(var.CargoTargetBinDir)\$(var.ProductName).exe'/>
+                            <RegistryValue
+                                Root='HKCU'
+                                Key='Software\$(var.ProductManufacturer)\$(var.ProductName)'
+                                Name='Binary'
+                                Type='string'
+                                Value='[Bin]$(var.ProductName).exe'
+                                KeyPath='yes'/>
+                        </Component>
+                    </Directory>
+                </Directory>
+            </Directory>
+            <Directory Id='ProgramMenuFolder'>
+                <Directory Id='ApplicationProgramsFolder' Name='$(var.ProductName)'>
+                    <Component Id='StartMenuShortcut' Guid='*'>
+                        <Shortcut
+                            Id='StartMenuShortcutLink'
+                            Name='$(var.ProductName)'
+                            Description='Launch $(var.ProductName)'
+                            Target='[Bin]$(var.ProductName).exe'
+                            WorkingDirectory='Bin'
+                            Icon='ProductICO'
+                            IconIndex='0'
+                            Advertise='no'/>
+                        <RemoveFolder Id='RemoveProgramsFolder' On='uninstall'/>
+                        <RegistryValue
+                            Root='HKCU'
+                            Key='Software\$(var.ProductManufacturer)\$(var.ProductName)'
+                            Name='StartMenuShortcut'
+                            Type='integer'
+                            Value='1'
+                            KeyPath='yes'/>
+                    </Component>
+                </Directory>
+            </Directory>
+        </Directory>
+
+        <Feature
+            Id='Binaries'
+            Title='Application'
+            Description='Installs all binaries.'
+            Level='1'
+            ConfigurableDirectory='APPLICATIONFOLDER'
+            AllowAdvertise='no'
+            Display='expand'
+            Absent='disallow'>
+
+            <ComponentRef Id='binary0'/>
+            <ComponentRef Id='AppFolderCleanup'/>
+            <ComponentRef Id='StartMenuShortcut'/>
+        </Feature>
+
+        <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
+
+        <Icon Id='ProductICO' SourceFile='assets/icons/Product.ico'/>
+        <Property Id='ARPPRODUCTICON' Value='ProductICO' />
+
+        <UI>
+            <UIRef Id='WixUI_FeatureTree'/>
+            <Publish Dialog='WelcomeDlg' Control='Next' Event='NewDialog' Value='CustomizeDlg' Order='99'>1</Publish>
+            <Publish Dialog='CustomizeDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg' Order='99'>1</Publish>
+        </UI>
+    </Product>
+
+</Wix>

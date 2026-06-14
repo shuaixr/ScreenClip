@@ -16,7 +16,7 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  build-windows:
     runs-on: windows-latest
 
     steps:
@@ -25,7 +25,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Prepare release tag
+      - name: Resolve release tag
         id: meta
         shell: pwsh
         run: |
@@ -33,25 +33,8 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($tagName)) {
             $tagName = "v${{ inputs.version }}"
           }
-
           "tag_name=$tagName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-
-          $localTag = git rev-parse --verify "refs/tags/$tagName" 2>$null
-          $remoteTag = git ls-remote --tags origin "refs/tags/$tagName"
-
-          if (-not $localTag -and -not [string]::IsNullOrWhiteSpace($remoteTag)) {
-            git fetch origin "refs/tags/$tagName:refs/tags/$tagName"
-            $localTag = git rev-parse --verify "refs/tags/$tagName" 2>$null
-          }
-
-          if (-not $localTag) {
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git tag -a $tagName -m "Release $tagName"
-            "tag_created=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          } else {
-            "tag_created=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          }
+          "TAG_NAME=$tagName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -71,64 +54,197 @@ jobs:
         shell: pwsh
         run: cargo build --release --verbose
 
-      - name: Install cargo-wix
+      - name: Install cargo-packager
         shell: pwsh
-        run: cargo install cargo-wix --locked
+        run: cargo install cargo-packager --locked
 
-      - name: Install WiX Toolset
+      - name: Package NSIS + MSI
         shell: pwsh
-        run: choco install wixtoolset -y --no-progress
+        run: cargo packager --release
 
-      - name: Locate WiX binaries
-        shell: pwsh
-        run: |
-          $candle = Get-ChildItem 'C:\Program Files','C:\Program Files (x86)' -Recurse -Filter candle.exe -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-
-          if (-not $candle) {
-            throw 'candle.exe not found after installing WiX Toolset'
-          }
-
-          "WIX_BIN_PATH=$($candle.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-      - name: Build MSI installer
-        shell: pwsh
-        run: cargo wix --no-build --profile release --nocapture --bin-path "$env:WIX_BIN_PATH"
-
-      - name: Resolve installer asset
-        id: package
+      - name: Locate Windows SDK signing tools
+        id: sdk
         shell: pwsh
         run: |
-          $tagName = "${{ steps.meta.outputs.tag_name }}"
-          $msi = Get-ChildItem -Path "target/wix" -Filter "*.msi" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits' -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } | Select-Object -First 1
+          $makeappx = Get-ChildItem 'C:\Program Files (x86)\Windows Kits' -Recurse -Filter makeappx.exe |
+            Where-Object { $_.FullName -match '\\x64\\makeappx\.exe$' } | Select-Object -First 1
+          if (-not $signtool) { throw 'signtool.exe not found in Windows Kits' }
+          if (-not $makeappx) { throw 'makeappx.exe not found in Windows Kits' }
+          "SIGNTOOL=$($signtool.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "MAKEAPPX=$($makeappx.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          if (-not $msi) {
-            throw "MSI not found under target/wix"
-          }
+      - name: Build MSIX
+        shell: pwsh
+        env:
+          SCREENCLIP_PFX_BASE64: ${{ secrets.SCREENCLIP_PFX_BASE64 }}
+          SCREENCLIP_PFX_PWD: ${{ secrets.SCREENCLIP_PFX_PWD }}
+        run: |
+          $tag = "${{ env.TAG_NAME }}"
+          $stage = "target\msix-staging"
+          Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
-          $assetName = "screenclip-$tagName-windows-x64.msi"
-          Copy-Item -Path $msi.FullName -Destination $assetName -Force
+          Copy-Item "target\release\screenclip.exe" "$stage\screenclip.exe"
+          Copy-Item "wix\AppxManifest.xml" "$stage\AppxManifest.xml"
+          New-Item -ItemType Directory -Force -Path "$stage\assets\icons" | Out-Null
+          Copy-Item "assets\icons\msix\*" "$stage\assets\icons\"
 
-          "asset_name=$assetName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          $msixOut = "screenclip-$tag-windows-x64.msix"
+          & $env:MAKEAPPX pack /d $stage /p $msixOut /o
+
+          $pfx = Join-Path $env:RUNNER_TEMP "screenclip.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SCREENCLIP_PFX_BASE64))
+          & $env:SIGNTOOL sign /fd SHA256 /a /f $pfx /p $env:SCREENCLIP_PFX_PWD `
+            /tr http://timestamp.ssl.com /td SHA256 $msixOut
+
+      - name: Rename Windows installers
+        shell: pwsh
+        run: |
+          $tag = "${{ env.TAG_NAME }}"
+          # cargo-packager emits e.g. screenclip_<version>_x64-setup.exe and
+          # screenclip_<version>_x64_en-US.msi. Normalize to the legacy scheme
+          # so existing release scripts and downloaders keep working.
+          Get-ChildItem -Path target/packages |
+            Where-Object { $_.Name -match 'setup\.exe$|\.msi$' } |
+            ForEach-Object {
+              $ext = if ($_.Name -match 'setup\.exe$') { 'exe' } else { 'msi' }
+              $newName = "screenclip-$tag-windows-x64.$ext"
+              Move-Item -Path $_.FullName -Destination $newName -Force
+            }
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenclip-windows
+          path: |
+            screenclip-*-windows-x64.exe
+            screenclip-*-windows-x64.msi
+            screenclip-*-windows-x64.msix
+
+  build-linux:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: meta
+        run: |
+          TAG_NAME="${{ inputs.tag_name }}"
+          if [ -z "$TAG_NAME" ]; then TAG_NAME="v${{ inputs.version }}"; fi
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "TAG_NAME=$TAG_NAME" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libssl-dev pkg-config libgtk-3-dev file
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked
+
+      - name: Build Linux packages
+        run: cargo packager --release --target x86_64-unknown-linux-gnu
+
+      - name: Rename Linux artifacts
+        run: |
+          TAG="${{ env.TAG_NAME }}"
+          cd target/packages
+          for f in screenclip_*_amd64.deb;       do [ -e "$f" ] && mv "$f" "screenclip-$TAG-linux-x64.deb";       done
+          for f in screenclip_*_amd64.AppImage;  do [ -e "$f" ] && mv "$f" "screenclip-$TAG-linux-x64.AppImage"; done
+          for f in screenclip_*_amd64;           do [ -e "$f" ] && mv "$f" "screenclip-$TAG-linux-x64";          done
+          cd ../..
+          # Move out of target/ so the upload pattern picks them up at the repo root.
+          find target/packages -maxdepth 1 -name 'screenclip-*' -exec mv {} . \;
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenclip-linux
+          path: |
+            screenclip-*-linux-x64.deb
+            screenclip-*-linux-x64.AppImage
+            screenclip-*-linux-x64
+
+  release:
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release tag
+        id: meta
+        run: |
+          TAG_NAME="${{ inputs.tag_name }}"
+          if [ -z "$TAG_NAME" ]; then TAG_NAME="v${{ inputs.version }}"; fi
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
+
+          LOCAL=$(git rev-parse --verify "refs/tags/$TAG_NAME" 2>/dev/null || true)
+          REMOTE=$(git ls-remote --tags origin "refs/tags/$TAG_NAME" | awk '{print $1}' || true)
+          if [ -z "$LOCAL" ] && [ -n "$REMOTE" ]; then
+            git fetch origin "refs/tags/$TAG_NAME:refs/tags/$TAG_NAME"
+            LOCAL=$(git rev-parse --verify "refs/tags/$TAG_NAME" 2>/dev/null || true)
+          fi
+          if [ -z "$LOCAL" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG_NAME" -m "Release $TAG_NAME"
+            echo "tag_created=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_created=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Push release tag
         if: steps.meta.outputs.tag_created == 'true'
-        shell: pwsh
-        run: |
-          $tagName = "${{ steps.meta.outputs.tag_name }}"
-          git push origin $tagName
+        run: git push origin "${{ steps.meta.outputs.tag_name }}"
 
       - name: Publish GitHub release
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tagName = "${{ steps.meta.outputs.tag_name }}"
-          $assetName = "${{ steps.package.outputs.asset_name }}"
-
-          gh release view $tagName 1>$null 2>$null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tagName $assetName --clobber
-          } else {
-            gh release create $tagName $assetName --title $tagName --generate-notes
-          }
+          TAG_NAME="${{ steps.meta.outputs.tag_name }}"
+          mapfile -t ASSETS < <(find artifacts -type f | sort)
+          if [ ${#ASSETS[@]} -eq 0 ]; then
+            echo "::error::No artifacts downloaded"
+            exit 1
+          fi
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            for f in "${ASSETS[@]}"; do gh release upload "$TAG_NAME" "$f" --clobber; done
+          else
+            FIRST="${ASSETS[0]}"
+            gh release create "$TAG_NAME" "$FIRST" --title "$TAG_NAME" --generate-notes
+            for f in "${ASSETS[@]:1}"; do gh release upload "$TAG_NAME" "$f" --clobber; done
+          fi

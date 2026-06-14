@@ -5,8 +5,66 @@ edition = "2021"
 authors = ["ScreenClip"]
 description = "Screenshot capture utility"
 
-[package.metadata.wix]
-eula = false
+[package.metadata.packager]
+product-name = "ScreenClip"
+identifier = "io.github.shuaixr.screenclip"
+publisher = "shuaixr"
+description = "Screenshot capture utility"
+long-description = "A Rust based screenshot utility built with egui and winit, focused on fast screen capture and annotation workflows, with global hotkey support and a desktop overlay UI."
+authors = ["ScreenClip"]
+copyright = "Copyright (c) 2026 ScreenClip"
+category = "Utility"
+homepage = "https://github.com/shuaixr/screenclip"
+out-dir = "target/packages"
+binaries-dir = "target/release"
+formats = ["nsis", "wix"]
+log-level = "info"
+
+icons = ["assets/icons/Product.ico", "assets/icons/256x256.png"]
+
+resources = [
+    "screenclip.desktop",
+    { src = "assets/icons/256x256.png", target = "screenclip.png" },
+]
+
+before-packaging-command = "cargo build --release"
+
+[package.metadata.packager.windows]
+digest-algorithm = "SHA-256"
+certificate-thumbprint = "3E572F5443B80E8E0AC906BDBCCC546CBB194CE0"
+tsp = true
+timestamp-url = "http://timestamp.ssl.com"
+allow-downgrades = true
+
+[package.metadata.packager.nsis]
+compression = "lzma"
+installer-icon = "assets/icons/Product.ico"
+install-mode = "perUser"
+appdata-paths = ["$LOCALAPPDATA/$PUBLISHER/$PRODUCTNAME"]
+preinstall-section = """
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Run" "ScreenClip" "$INSTDIR\\screenclip.exe"
+  Push "$INSTDIR"
+  Call EnvVarPathAdd
+"""
+
+[package.metadata.packager.wix]
+languages = ["en-US"]
+template = "wix/template.wxs"
+
+[package.metadata.packager.deb]
+depends = [
+    "libc6",
+    "libx11-6",
+    "libxcb1",
+    "libxkbcommon0",
+    "libwayland-client0",
+    "libgtk-3-0",
+]
+section = "graphics"
+priority = "optional"
+
+[package.metadata.packager.appimage]
+bundle-xdg-open = true
 
 [build-dependencies]
 winres = "0.1"
