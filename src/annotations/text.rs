@@ -447,6 +447,7 @@ pub fn draw_preview(
     annotations: &[TextAnnotation],
     text_fonts: &[FontArc],
     focused_annotation_id: Option<u64>,
+    color: Rgba<u8>,
 ) {
     if text_fonts.is_empty() {
         return;
@@ -466,7 +467,7 @@ pub fn draw_preview(
                 continue;
             }
         } else {
-            (annotation.text.as_str(), Rgba([255, 255, 255, 255]))
+            (annotation.text.as_str(), color)
         };
 
         let text_bounds = measure_text_bounds(text_fonts, annotation.line_height_pixels, text);
@@ -533,6 +534,7 @@ pub fn render_to_image(
     rect: (i32, i32, i32, i32),
     annotations: &[TextAnnotation],
     text_fonts: &[FontArc],
+    color: Rgba<u8>,
 ) -> Result<(), String> {
     if text_fonts.is_empty() {
         if !annotations.is_empty() {
@@ -557,7 +559,7 @@ pub fn render_to_image(
         let local_y = annotation.global_pos.1 - ry;
         draw_text_line_image(
             image,
-            Rgba([255, 255, 255, 255]),
+            color,
             local_x,
             local_y,
             annotation.line_height_pixels,
@@ -1033,4 +1035,60 @@ fn blend_selection_pixel(dst: u32) -> u32 {
     let g = sg * alpha + dg * (1.0 - alpha);
     let b = sb * alpha + db * (1.0 - alpha);
     ((r.round() as u32) << 16) | ((g.round() as u32) << 8) | b.round() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_fonts() -> Vec<FontArc> {
+        let bytes = load_text_font_bytes_for_tests();
+        bytes
+            .into_iter()
+            .filter_map(|b| FontArc::try_from_vec(b).ok())
+            .collect()
+    }
+
+    fn load_text_font_bytes_for_tests() -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for path in [
+            r"C:\Windows\Fonts\segoeui.ttf",
+            r"C:\Windows\Fonts\arial.ttf",
+            r"C:\Windows\Fonts\consola.ttf",
+        ] {
+            if let Ok(bytes) = std::fs::read(path) {
+                out.push(bytes);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn custom_text_color_is_respected() {
+        let fonts = dummy_fonts();
+        if fonts.is_empty() {
+            // No fonts available on this host — nothing to test.
+            return;
+        }
+
+        let mut image = RgbaImage::from_pixel(200, 200, Rgba([0, 0, 0, 0]));
+        let mut annotation = TextAnnotation::new(0, (10, 10), TEXT_LINE_HEIGHT_PIXELS);
+        annotation.text = "X".to_string();
+        let red = Rgba([255, 0, 0, 255]);
+
+        render_to_image(
+            &mut image,
+            (0, 0, 200, 200),
+            &[annotation],
+            &fonts,
+            red,
+        )
+        .unwrap();
+
+        let red_count = image
+            .pixels()
+            .filter(|p| p[0] > 200 && p[1] < 50 && p[2] < 50)
+            .count();
+        assert!(red_count > 0, "expected at least one red pixel from custom text color");
+    }
 }

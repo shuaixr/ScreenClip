@@ -6,6 +6,7 @@ mod cpu_renderer;
 mod desktop_geometry;
 mod hotkeys;
 mod overlay_ui;
+mod secondary_toolbar;
 mod selection_geometry;
 mod tray;
 
@@ -21,7 +22,7 @@ use arboard::{Clipboard, ImageData};
 use cpu_present::CpuPresenter;
 use cpu_renderer::CpuRenderer;
 use log::{info, warn};
-use overlay_ui::{OverlayAction, OverlayUi, ToolMode};
+use overlay_ui::{ColorTarget, OverlayAction, OverlayUi, ToolMode};
 use screenshots::image::{imageops::FilterType, Rgba, RgbaImage};
 use screenshots::Screen;
 use selection_geometry::ResizeEdge;
@@ -85,6 +86,40 @@ struct SelectionResizeDrag {
     edge: ResizeEdge,
 }
 
+/// Active styling for each annotation kind. Session-scoped — reset between
+/// capture sessions. Read via `get`, mutated via `set` so call sites don't
+/// grow a new match arm per kind.
+#[derive(Debug, Clone, Copy)]
+struct AnnotationColors {
+    text: Rgba<u8>,
+    rectangle: Rgba<u8>,
+}
+
+impl Default for AnnotationColors {
+    fn default() -> Self {
+        Self {
+            text: Rgba([255, 255, 255, 255]),
+            rectangle: Rgba([0x1A, 0xB3, 0xFF, 0xFF]),
+        }
+    }
+}
+
+impl AnnotationColors {
+    fn get(&self, target: ColorTarget) -> Rgba<u8> {
+        match target {
+            ColorTarget::Text => self.text,
+            ColorTarget::Rectangle => self.rectangle,
+        }
+    }
+
+    fn set(&mut self, target: ColorTarget, color: Rgba<u8>) {
+        match target {
+            ColorTarget::Text => self.text = color,
+            ColorTarget::Rectangle => self.rectangle = color,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EscapeAction {
     ExitTextMode,
@@ -129,6 +164,8 @@ struct App {
     next_caret_redraw: Option<Instant>,
     focused_text_annotation_id: Option<u64>,
     text_annotation_drag: Option<TextAnnotationDrag>,
+    /// Active styling for each annotation kind. Session-scoped.
+    annotation_colors: AnnotationColors,
     /// The previous `SPI_GETANIMATION` value captured right before we disabled
     /// window animations for a capture session, so we can restore it afterwards.
     /// `None` means no restore is pending.
@@ -161,6 +198,7 @@ impl App {
             next_caret_redraw: None,
             focused_text_annotation_id: None,
             text_annotation_drag: None,
+            annotation_colors: AnnotationColors::default(),
             #[cfg(target_os = "windows")]
             saved_animation_info: None,
         }
@@ -325,6 +363,7 @@ impl App {
         self.next_caret_redraw = None;
         self.focused_text_annotation_id = None;
         self.text_annotation_drag = None;
+        self.annotation_colors = AnnotationColors::default();
     }
 
     fn escape_action(&self) -> Option<EscapeAction> {
@@ -384,6 +423,62 @@ impl App {
         egui_ctx.set_fonts(fonts);
         egui_ctx.set_visuals(egui::Visuals::dark());
         egui_ctx
+    }
+
+    /// Saves the current selection to disk via a file dialog. Hides the overlay
+    /// windows first so the dialog does not flash on top of them.
+    fn handle_save(&mut self) {
+        info!("[save] pending_save=true selected_rect={:?}", self.selected_rect);
+        if let Some(rect) = self.selected_rect {
+            for ws in self.windows.values() {
+                ws.window.set_visible(false);
+            }
+            info!("[save] windows hidden, opening file dialog");
+            let path = rfd::FileDialog::new()
+                .set_file_name("screenshot.png")
+                .add_filter("PNG Image", &["png"])
+                .save_file();
+            info!("[save] file dialog returned {:?}", path);
+            if let Some(path) = path {
+                match save_selection_to_file(
+                    &self.captures,
+                    rect,
+                    &path,
+                    &self.text_annotations,
+                    &self.rectangle_annotations,
+                    &self.text_fonts,
+                    self.annotation_colors.get(ColorTarget::Text),
+                    self.annotation_colors.get(ColorTarget::Rectangle),
+                ) {
+                    Ok(()) => info!("saved screenshot to {}", path.display()),
+                    Err(e) => warn!("failed to save screenshot: {}", e),
+                }
+            }
+        }
+        self.end_capture_session();
+    }
+
+    /// Copies the current selection (with annotations burned in) to the clipboard.
+    fn handle_copy(&mut self) {
+        info!("[copy] pending_copy=true selected_rect={:?}", self.selected_rect);
+        if let Some(rect) = self.selected_rect {
+            match compose_selection_image(
+                &self.captures,
+                rect,
+                &self.text_annotations,
+                &self.rectangle_annotations,
+                &self.text_fonts,
+                self.annotation_colors.get(ColorTarget::Text),
+                self.annotation_colors.get(ColorTarget::Rectangle),
+            ) {
+                Ok(image) => match copy_image_to_clipboard(image) {
+                    Ok(()) => info!("copied screenshot to clipboard"),
+                    Err(err) => warn!("failed to copy screenshot to clipboard: {}", err),
+                },
+                Err(err) => warn!("failed to compose screenshot for clipboard: {}", err),
+            }
+        }
+        self.end_capture_session();
     }
 }
 
@@ -753,149 +848,132 @@ impl ApplicationHandler<AppEvent> for App {
             return;
         }
 
-        let now = Instant::now();
-        let caret_redraw_due = self
-            .next_caret_redraw
-            .is_some_and(|deadline| now >= deadline);
+        // The render + action processing lives in a loop. A color change applied
+        // during render forces one more render in the same call so the new color
+        // appears in this frame; without the loop, the user would see the old
+        // color until the next event (e.g. a mouse nudge) triggered a redraw,
+        // which felt like a half-second lag. Session-ending actions (Save /
+        // Copy / Exit) break out of the loop instead of re-rendering.
+        let mut session_ended = false;
+        loop {
+            let now = Instant::now();
+            let caret_redraw_due = self
+                .next_caret_redraw
+                .is_some_and(|deadline| now >= deadline);
 
-        if !self.needs_redraw && !caret_redraw_due {
-            if let Some(deadline) = self.next_caret_redraw {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-            } else {
-                event_loop.set_control_flow(ControlFlow::Wait);
-            }
-            return;
-        }
-
-        self.needs_redraw = false;
-
-        let drag_rect = current_selection_rect(self.drag_start, self.drag_current);
-        let active_selection_rect = match self.tool_mode {
-            ToolMode::Select => drag_rect.or(self.selected_rect),
-            ToolMode::Text | ToolMode::Rectangle => self.selected_rect,
-        };
-        let active_annotation_rect = match self.tool_mode {
-            ToolMode::Rectangle => drag_rect,
-            _ => None,
-        };
-        let show_toolbar = self.drag_start.is_none()
-            && self.selection_resize.is_none()
-            && self.selected_rect.is_some();
-
-        let mut pending_save = false;
-        let mut pending_copy = false;
-        let mut pending_exit = false;
-        let mut focused_text_annotation_id = None;
-        let existing_focused_text_annotation_id = self.focused_text_annotation_id;
-        let dragging_text_annotation_id = self.text_annotation_drag.as_ref().map(|drag| drag.id);
-        let selection_resize_edge = self.selection_resize.map(|drag| drag.edge);
-        for state in self.windows.values_mut() {
-            let (action, focused_annotation_id) = render_window_cpu(
-                state,
-                active_selection_rect,
-                active_annotation_rect,
-                self.selected_rect,
-                self.last_cursor_global,
-                show_toolbar,
-                self.tool_mode,
-                &mut self.text_annotations,
-                &self.rectangle_annotations,
-                &mut self.pending_text_focus_id,
-                &self.text_fonts,
-                existing_focused_text_annotation_id,
-                dragging_text_annotation_id,
-                selection_resize_edge,
-            );
-            if let Some(id) = focused_annotation_id {
-                focused_text_annotation_id = Some(id);
-            }
-            if action == OverlayAction::Save {
-                info!("[about_to_wait] OverlayAction::Save received");
-                pending_save = true;
-            } else if action == OverlayAction::Copy {
-                info!("[about_to_wait] OverlayAction::Copy received");
-                pending_copy = true;
-            } else if action == OverlayAction::StartTextInsert {
-                self.tool_mode = if self.tool_mode == ToolMode::Text {
-                    ToolMode::Select
+            if !self.needs_redraw && !caret_redraw_due {
+                if let Some(deadline) = self.next_caret_redraw {
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
                 } else {
-                    ToolMode::Text
-                };
-            } else if action == OverlayAction::StartRectangleInsert {
-                self.tool_mode = if self.tool_mode == ToolMode::Rectangle {
-                    ToolMode::Select
-                } else {
-                    ToolMode::Rectangle
-                };
-            } else if action == OverlayAction::Exit {
-                info!("[about_to_wait] OverlayAction::Exit received");
-                pending_exit = true;
-            }
-        }
-        if focused_text_annotation_id.is_none() {
-            focused_text_annotation_id = dragging_text_annotation_id;
-        }
-        self.focused_text_annotation_id = focused_text_annotation_id;
-
-        if pending_exit {
-            self.end_capture_session();
-            return;
-        }
-
-        if pending_save {
-            info!(
-                "[save] pending_save=true selected_rect={:?}",
-                self.selected_rect
-            );
-            if let Some(rect) = self.selected_rect {
-                for ws in self.windows.values() {
-                    ws.window.set_visible(false);
+                    event_loop.set_control_flow(ControlFlow::Wait);
                 }
-                info!("[save] windows hidden, opening file dialog");
-                let path = rfd::FileDialog::new()
-                    .set_file_name("screenshot.png")
-                    .add_filter("PNG Image", &["png"])
-                    .save_file();
-                info!("[save] file dialog returned {:?}", path);
-                if let Some(path) = path {
-                    match save_selection_to_file(
-                        &self.captures,
-                        rect,
-                        &path,
-                        &self.text_annotations,
-                        &self.rectangle_annotations,
-                        &self.text_fonts,
-                    ) {
-                        Ok(()) => info!("saved screenshot to {}", path.display()),
-                        Err(e) => warn!("failed to save screenshot: {}", e),
-                    }
-                }
+                return;
             }
-            self.end_capture_session();
-            return;
-        }
+            self.needs_redraw = false;
 
-        if pending_copy {
-            info!(
-                "[copy] pending_copy=true selected_rect={:?}",
-                self.selected_rect
-            );
-            if let Some(rect) = self.selected_rect {
-                match compose_selection_image(
-                    &self.captures,
-                    rect,
-                    &self.text_annotations,
+            let drag_rect = current_selection_rect(self.drag_start, self.drag_current);
+            let active_selection_rect = match self.tool_mode {
+                ToolMode::Select => drag_rect.or(self.selected_rect),
+                ToolMode::Text | ToolMode::Rectangle => self.selected_rect,
+            };
+            let active_annotation_rect = match self.tool_mode {
+                ToolMode::Rectangle => drag_rect,
+                _ => None,
+            };
+            let show_toolbar = self.drag_start.is_none()
+                && self.selection_resize.is_none()
+                && self.selected_rect.is_some();
+
+            let mut pending_save = false;
+            let mut pending_copy = false;
+            let mut pending_exit = false;
+            let mut needs_rerender = false;
+            let mut focused_text_annotation_id = None;
+            let existing_focused_text_annotation_id = self.focused_text_annotation_id;
+            let dragging_text_annotation_id =
+                self.text_annotation_drag.as_ref().map(|drag| drag.id);
+            let selection_resize_edge = self.selection_resize.map(|drag| drag.edge);
+            for state in self.windows.values_mut() {
+                let (action, focused_annotation_id) = render_window_cpu(
+                    state,
+                    active_selection_rect,
+                    active_annotation_rect,
+                    self.selected_rect,
+                    self.last_cursor_global,
+                    show_toolbar,
+                    self.tool_mode,
+                    self.annotation_colors.get(ColorTarget::Text),
+                    self.annotation_colors.get(ColorTarget::Rectangle),
+                    &mut self.text_annotations,
                     &self.rectangle_annotations,
+                    &mut self.pending_text_focus_id,
                     &self.text_fonts,
-                ) {
-                    Ok(image) => match copy_image_to_clipboard(image) {
-                        Ok(()) => info!("copied screenshot to clipboard"),
-                        Err(err) => warn!("failed to copy screenshot to clipboard: {}", err),
-                    },
-                    Err(err) => warn!("failed to compose screenshot for clipboard: {}", err),
+                    existing_focused_text_annotation_id,
+                    dragging_text_annotation_id,
+                    selection_resize_edge,
+                );
+                if let Some(id) = focused_annotation_id {
+                    focused_text_annotation_id = Some(id);
+                }
+                if action == OverlayAction::Save {
+                    info!("[about_to_wait] OverlayAction::Save received");
+                    pending_save = true;
+                } else if action == OverlayAction::Copy {
+                    info!("[about_to_wait] OverlayAction::Copy received");
+                    pending_copy = true;
+                } else if action == OverlayAction::StartTextInsert {
+                    self.tool_mode = if self.tool_mode == ToolMode::Text {
+                        ToolMode::Select
+                    } else {
+                        ToolMode::Text
+                    };
+                } else if action == OverlayAction::StartRectangleInsert {
+                    self.tool_mode = if self.tool_mode == ToolMode::Rectangle {
+                        ToolMode::Select
+                    } else {
+                        ToolMode::Rectangle
+                    };
+                } else if action == OverlayAction::Exit {
+                    info!("[about_to_wait] OverlayAction::Exit received");
+                    pending_exit = true;
+                } else if let OverlayAction::SetAnnotationColor(target, c) = action {
+                    self.annotation_colors.set(target, c);
+                    // Render is now one frame behind reality — flip both flags
+                    // so the loop's next iteration passes the redraw gate and
+                    // paints the new color in the same `about_to_wait` call.
+                    self.needs_redraw = true;
+                    needs_rerender = true;
                 }
             }
-            self.end_capture_session();
+            if focused_text_annotation_id.is_none() {
+                focused_text_annotation_id = dragging_text_annotation_id;
+            }
+            self.focused_text_annotation_id = focused_text_annotation_id;
+
+            if pending_exit {
+                self.end_capture_session();
+                session_ended = true;
+                break;
+            }
+            if pending_save {
+                self.handle_save();
+                session_ended = true;
+                break;
+            }
+            if pending_copy {
+                self.handle_copy();
+                session_ended = true;
+                break;
+            }
+            if !needs_rerender {
+                break;
+            }
+            // Re-render so the new color is visible this frame. egui's
+            // `clicked()` is one-shot per pass, so the second render produces
+            // no further color action and the loop terminates next iteration.
+        }
+
+        if session_ended {
             return;
         }
 
@@ -924,6 +1002,8 @@ fn save_selection_to_file(
     text_annotations: &[TextAnnotation],
     rectangle_annotations: &[RectangleAnnotation],
     text_fonts: &[FontArc],
+    text_color: Rgba<u8>,
+    rectangle_color: Rgba<u8>,
 ) -> Result<(), String> {
     let output = compose_selection_image(
         captures,
@@ -931,6 +1011,8 @@ fn save_selection_to_file(
         text_annotations,
         rectangle_annotations,
         text_fonts,
+        text_color,
+        rectangle_color,
     )?;
 
     output
@@ -946,6 +1028,8 @@ fn compose_selection_image(
     text_annotations: &[TextAnnotation],
     rectangle_annotations: &[RectangleAnnotation],
     text_fonts: &[FontArc],
+    text_color: Rgba<u8>,
+    rectangle_color: Rgba<u8>,
 ) -> Result<RgbaImage, String> {
     let (x, y, w, h) = rect;
     if w <= 0 || h <= 0 {
@@ -985,8 +1069,8 @@ fn compose_selection_image(
         }
     }
 
-    annotations::text::render_to_image(&mut output, rect, text_annotations, text_fonts)?;
-    annotations::rectangle::render_to_image(&mut output, rect, rectangle_annotations);
+    annotations::text::render_to_image(&mut output, rect, text_annotations, text_fonts, text_color)?;
+    annotations::rectangle::render_to_image(&mut output, rect, rectangle_annotations, rectangle_color);
 
     Ok(output)
 }
@@ -1152,6 +1236,8 @@ fn render_window_cpu(
     cursor_global: Option<(i32, i32)>,
     show_toolbar: bool,
     tool_mode: ToolMode,
+    text_color: Rgba<u8>,
+    rectangle_color: Rgba<u8>,
     text_annotations: &mut [TextAnnotation],
     rectangle_annotations: &[RectangleAnnotation],
     pending_text_focus_id: &mut Option<u64>,
@@ -1168,6 +1254,9 @@ fn render_window_cpu(
         active_selection_rect,
         cursor_global,
         show_toolbar,
+        tool_mode,
+        text_color,
+        rectangle_color,
         state.origin,
         (state.size.width, state.size.height),
         pixels_per_point,
@@ -1230,6 +1319,7 @@ fn render_window_cpu(
                 text_annotations,
                 text_fonts,
                 visual_focused_annotation_id,
+                text_color,
             );
             annotations::rectangle::draw_preview(
                 renderer.frame_mut(),
@@ -1237,6 +1327,7 @@ fn render_window_cpu(
                 state.origin,
                 rectangle_annotations,
                 active_annotation_rect,
+                rectangle_color,
             );
         },
     );
