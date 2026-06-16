@@ -1,5 +1,8 @@
 use egui;
+use screenshots::image::Rgba;
 use winit::dpi::PhysicalPosition;
+
+use crate::secondary_toolbar;
 
 pub fn size_label_anchor(x: i32, y: i32, h: i32) -> (i32, i32) {
     (x, y + h - 1)
@@ -98,6 +101,7 @@ pub enum OverlayAction {
     StartTextInsert,
     StartRectangleInsert,
     Exit,
+    SetAnnotationColor(ColorTarget, Rgba<u8>),
 }
 
 /// Active tool. `Select` is the default: drag to make a screenshot region.
@@ -106,6 +110,14 @@ pub enum OverlayAction {
 pub enum ToolMode {
     #[default]
     Select,
+    Text,
+    Rectangle,
+}
+
+/// Kinds of annotations that have user-selectable styling. `Select` is intentionally
+/// absent — selecting a region has no color/style concept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorTarget {
     Text,
     Rectangle,
 }
@@ -127,6 +139,9 @@ impl OverlayUi {
         active_rect: Option<(i32, i32, i32, i32)>,
         _cursor_global: Option<(i32, i32)>,
         show_toolbar: bool,
+        tool_mode: ToolMode,
+        text_color: Rgba<u8>,
+        rectangle_color: Rgba<u8>,
         window_origin: PhysicalPosition<i32>,
         window_size: (u32, u32),
         pixels_per_point: f32,
@@ -166,7 +181,25 @@ impl OverlayUi {
         }
 
         if show_toolbar && owns_toolbar {
-            return self.draw_toolbar(ctx, local_right, local_top, local_bottom, win_w, win_h);
+            let (primary_action, primary_pos, primary_size) =
+                self.draw_toolbar(ctx, local_right, local_top, local_bottom, win_w, win_h);
+
+            if !matches!(tool_mode, ToolMode::Select) {
+                let (target, current) = match tool_mode {
+                    ToolMode::Text => (ColorTarget::Text, text_color),
+                    ToolMode::Rectangle => (ColorTarget::Rectangle, rectangle_color),
+                    ToolMode::Select => unreachable!(),
+                };
+                let sec_pos = secondary_toolbar::compute_pos(primary_pos, primary_size, win_w, win_h, local_top);
+                let sec_action = secondary_toolbar::draw(ctx, target, current, sec_pos);
+                return if matches!(sec_action, OverlayAction::None) {
+                    primary_action
+                } else {
+                    sec_action
+                };
+            }
+
+            return primary_action;
         }
 
         OverlayAction::None
@@ -229,7 +262,7 @@ impl OverlayUi {
         local_bottom: f32,
         win_w: f32,
         win_h: f32,
-    ) -> OverlayAction {
+    ) -> (OverlayAction, egui::Pos2, egui::Vec2) {
         const BTN: f32 = 32.0;
         const GAP: f32 = 4.0;
         const PAD: f32 = 4.0;
@@ -286,7 +319,7 @@ impl OverlayUi {
                     });
             });
 
-        action
+        (action, pos, egui::vec2(toolbar_w, toolbar_h))
     }
 }
 

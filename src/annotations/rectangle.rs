@@ -1,10 +1,9 @@
-use screenshots::image::RgbaImage;
+use screenshots::image::{Rgba, RgbaImage};
 use winit::dpi::PhysicalPosition;
 
 use crate::desktop_geometry::DesktopRect;
 
 pub const RECTANGLE_BORDER_THICKNESS: i32 = 3;
-const RECTANGLE_BORDER_COLOR: u32 = 0x001AB3FF;
 
 #[derive(Debug, Clone)]
 pub struct RectangleAnnotation {
@@ -17,6 +16,7 @@ pub fn draw_preview(
     window_origin: PhysicalPosition<i32>,
     annotations: &[RectangleAnnotation],
     active_rect: Option<(i32, i32, i32, i32)>,
+    border_color: Rgba<u8>,
 ) {
     let window_rect = DesktopRect::from_origin_size(
         (window_origin.x, window_origin.y),
@@ -27,12 +27,12 @@ pub fn draw_preview(
 
     for annotation in annotations {
         if rect_intersects_viewport(annotation.global_rect, window_rect) {
-            stroke_into_surface(&mut surface, annotation.global_rect, origin);
+            stroke_into_surface(&mut surface, annotation.global_rect, origin, border_color);
         }
     }
     if let Some(active) = active_rect {
         if rect_intersects_viewport(active, window_rect) {
-            stroke_into_surface(&mut surface, active, origin);
+            stroke_into_surface(&mut surface, active, origin, border_color);
         }
     }
 }
@@ -41,6 +41,7 @@ pub fn render_to_image(
     image: &mut RgbaImage,
     selection: (i32, i32, i32, i32),
     annotations: &[RectangleAnnotation],
+    border_color: Rgba<u8>,
 ) {
     let (sx, sy, sw, sh) = selection;
     let selection_rect = DesktopRect::from_origin_size((sx, sy), (sw, sh));
@@ -49,7 +50,7 @@ pub fn render_to_image(
 
     for annotation in annotations {
         if rect_intersects_viewport(annotation.global_rect, selection_rect) {
-            stroke_into_surface(&mut surface, annotation.global_rect, origin);
+            stroke_into_surface(&mut surface, annotation.global_rect, origin, border_color);
         }
     }
 }
@@ -66,16 +67,17 @@ fn stroke_into_surface<S: Surface>(
     surface: &mut S,
     global_rect: (i32, i32, i32, i32),
     origin: (i32, i32),
+    color: Rgba<u8>,
 ) {
     let (rx, ry, rw, rh) = global_rect;
     let c0 = rx - origin.0;
     let r0 = ry - origin.1;
     let c1 = c0 + rw;
     let r1 = r0 + rh;
-    stroke_edges(surface, c0, r0, c1, r1);
+    stroke_edges(surface, c0, r0, c1, r1, color);
 }
 
-fn stroke_edges<S: Surface>(surface: &mut S, c0: i32, r0: i32, c1: i32, r1: i32) {
+fn stroke_edges<S: Surface>(surface: &mut S, c0: i32, r0: i32, c1: i32, r1: i32, color: Rgba<u8>) {
     if c0 >= c1 || r0 >= r1 {
         return;
     }
@@ -88,35 +90,35 @@ fn stroke_edges<S: Surface>(surface: &mut S, c0: i32, r0: i32, c1: i32, r1: i32)
     if r0 < top_end {
         for ly in r0..top_end {
             for lx in c0..c1 {
-                surface.write_pixel(lx, ly);
+                surface.write_pixel(lx, ly, color);
             }
         }
     }
     if bottom_start < r1 {
         for ly in bottom_start..r1 {
             for lx in c0..c1 {
-                surface.write_pixel(lx, ly);
+                surface.write_pixel(lx, ly, color);
             }
         }
     }
     if c0 < left_end {
         for ly in r0..r1 {
             for lx in c0..left_end {
-                surface.write_pixel(lx, ly);
+                surface.write_pixel(lx, ly, color);
             }
         }
     }
     if right_start < c1 {
         for ly in r0..r1 {
             for lx in right_start..c1 {
-                surface.write_pixel(lx, ly);
+                surface.write_pixel(lx, ly, color);
             }
         }
     }
 }
 
 trait Surface {
-    fn write_pixel(&mut self, lx: i32, ly: i32);
+    fn write_pixel(&mut self, lx: i32, ly: i32, color: Rgba<u8>);
 }
 
 struct FrameSurface<'a> {
@@ -125,7 +127,7 @@ struct FrameSurface<'a> {
 }
 
 impl<'a> Surface for FrameSurface<'a> {
-    fn write_pixel(&mut self, lx: i32, ly: i32) {
+    fn write_pixel(&mut self, lx: i32, ly: i32, color: Rgba<u8>) {
         if lx < 0 || ly < 0 {
             return;
         }
@@ -134,7 +136,8 @@ impl<'a> Surface for FrameSurface<'a> {
         if ulx >= self.size.0 || uly >= self.size.1 {
             return;
         }
-        self.frame[(uly * self.size.0 + ulx) as usize] = RECTANGLE_BORDER_COLOR;
+        self.frame[(uly * self.size.0 + ulx) as usize] =
+            ((color[0] as u32) << 16) | ((color[1] as u32) << 8) | (color[2] as u32);
     }
 }
 
@@ -143,7 +146,7 @@ struct ImageSurface<'a> {
 }
 
 impl<'a> Surface for ImageSurface<'a> {
-    fn write_pixel(&mut self, lx: i32, ly: i32) {
+    fn write_pixel(&mut self, lx: i32, ly: i32, color: Rgba<u8>) {
         if lx < 0 || ly < 0 {
             return;
         }
@@ -152,23 +155,19 @@ impl<'a> Surface for ImageSurface<'a> {
         if ulx >= self.image.width() || uly >= self.image.height() {
             return;
         }
-        let pixel = self.image.get_pixel_mut(ulx, uly);
-        pixel[0] = (RECTANGLE_BORDER_COLOR >> 16) as u8;
-        pixel[1] = (RECTANGLE_BORDER_COLOR >> 8) as u8;
-        pixel[2] = RECTANGLE_BORDER_COLOR as u8;
-        pixel[3] = 0xFF;
+        *self.image.get_pixel_mut(ulx, uly) = color;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use screenshots::image::Rgba;
 
-    const BORDER: u32 = 0x001AB3FF;
+    const BORDER_RGBA: Rgba<u8> = Rgba([0x1A, 0xB3, 0xFF, 0xFF]);
+    const BORDER_U32: u32 = 0x001AB3FF;
 
     fn count_border_pixels(frame: &[u32]) -> usize {
-        frame.iter().filter(|&&p| p == BORDER).count()
+        frame.iter().filter(|&&p| p == BORDER_U32).count()
     }
 
     // 100x50 rectangle perimeter (3px thick):
@@ -192,6 +191,7 @@ mod tests {
             PhysicalPosition::new(0, 0),
             &[annotation.clone()],
             None,
+            BORDER_RGBA,
         );
         draw_preview(
             &mut frame_right,
@@ -199,6 +199,7 @@ mod tests {
             PhysicalPosition::new(1920, 0),
             &[annotation],
             None,
+            BORDER_RGBA,
         );
 
         let left = count_border_pixels(&frame_left);
@@ -222,6 +223,7 @@ mod tests {
             PhysicalPosition::new(0, 0),
             &[],
             active,
+            BORDER_RGBA,
         );
         draw_preview(
             &mut frame_right,
@@ -229,6 +231,7 @@ mod tests {
             PhysicalPosition::new(1920, 0),
             &[],
             active,
+            BORDER_RGBA,
         );
 
         let left = count_border_pixels(&frame_left);
@@ -250,6 +253,7 @@ mod tests {
             &mut image,
             (0, 0, 200, 200),
             &[inside, outside],
+            BORDER_RGBA,
         );
 
         let blue_count = image
@@ -258,5 +262,24 @@ mod tests {
             .count();
 
         assert_eq!(blue_count, expected_perimeter(50, 50, 3) as usize);
+    }
+
+    #[test]
+    fn border_color_is_respected() {
+        let mut image = RgbaImage::from_pixel(100, 100, Rgba([0, 0, 0, 0]));
+        let red = Rgba([255, 0, 0, 255]);
+
+        render_to_image(
+            &mut image,
+            (0, 0, 100, 100),
+            &[RectangleAnnotation { global_rect: (10, 10, 50, 50) }],
+            red,
+        );
+
+        let red_count = image
+            .pixels()
+            .filter(|p| p[0] == 255 && p[1] == 0 && p[2] == 0)
+            .count();
+        assert_eq!(red_count, expected_perimeter(50, 50, 3) as usize);
     }
 }
